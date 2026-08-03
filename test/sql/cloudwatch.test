@@ -1,0 +1,112 @@
+# name: test/sql/cloudwatch.test
+# description: offline CloudWatch Logs extension tests
+# group: [sql]
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example');
+----
+does not exist
+
+require cloudwatch
+
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_cloudwatch_logs';
+----
+true
+
+# ATTACH option validation is performed before AWS credential lookup, keeping these catalog
+# tests offline. Successful catalog attachment is covered by the integration smoke test.
+statement error
+ATTACH 'not-cloudwatch:' AS cw_bad_path (TYPE cloudwatch, LOG_GROUPS []);
+----
+must be attached from the path 'cloudwatch:'
+
+statement error
+ATTACH 'cloudwatch:' AS cw_bad_groups (TYPE cloudwatch, LOG_GROUPS ['']);
+----
+LOG_GROUPS must not contain empty names
+
+statement error
+ATTACH 'cloudwatch:' AS cw_bad_page (TYPE cloudwatch, LOG_GROUPS []::VARCHAR[], PAGE_SIZE 0);
+----
+page_size must be between 1 and 10000
+
+statement error
+ATTACH 'cloudwatch:' AS cw_bad_option (TYPE cloudwatch, LOG_GROUPS []::VARCHAR[], UNKNOWN 'value');
+----
+Unsupported CloudWatch ATTACH option 'unknown'
+
+# Credentials are resolved at bind time and use DuckDB's AWS secret format.
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example');
+----
+No AWS credentials found
+
+# Argument validation is deliberately performed before credential lookup, keeping these tests
+# offline and making configuration mistakes deterministic.
+statement error
+SELECT * FROM read_cloudwatch_logs('');
+----
+log_group must not be empty
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', page_size => 0);
+----
+page_size must be between 1 and 10000
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', page_size => 10001);
+----
+page_size must be between 1 and 10000
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', max_rows => -1);
+----
+max_rows must be >= 0
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', retries => -1);
+----
+retries must be >= 0
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', timeout => 0);
+----
+timeout must be >= 1
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', "order" => 'newest');
+----
+order must be either 'asc' or 'desc'
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example',
+                                   log_stream_prefix => '2026/',
+                                   log_streams => ['2026/08/03/[$LATEST]abc']);
+----
+mutually exclusive
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', unknown_option => true);
+----
+Invalid named parameter
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', endpoint => 'https://logs.example.test/api');
+----
+endpoint must be an origin
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', endpoint => 'ftp://logs.example.test');
+----
+endpoint scheme must be HTTP or HTTPS
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', endpoint => 'https://');
+----
+endpoint must include a host
+
+statement error
+SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', endpoint => 'http://logs.example.test');
+----
+plaintext HTTP endpoints are allowed only on loopback
