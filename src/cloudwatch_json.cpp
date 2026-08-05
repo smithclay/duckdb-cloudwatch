@@ -6,6 +6,8 @@
 #include "yyjson.hpp"
 
 #include <cstdlib>
+#include <algorithm>
+#include <limits>
 #include <memory>
 
 using namespace duckdb_yyjson; // NOLINT
@@ -194,6 +196,102 @@ string BuildCloudwatchLogAttributes(const string &event_id) {
 	yyjson_mut_doc_set_root(doc.get(), root);
 	AddString(doc.get(), root, "aws.cloudwatch.log.event_id", event_id);
 	return WriteJson(doc.get());
+}
+
+vector<CloudwatchPutBatch> SortAndPlanCloudwatchPutEvents(vector<CloudwatchPutLogEvent> &events) {
+	for (const auto &event : events) {
+		if (event.message.empty()) {
+			throw InvalidInputException("send_cloudwatch_logs: body/message must not be empty (input row %d)",
+			                            event.source_row + 1);
+		}
+		if (event.message.size() > CLOUDWATCH_PUT_MAX_BYTES - CLOUDWATCH_PUT_EVENT_OVERHEAD) {
+			throw InvalidInputException(
+			    "send_cloudwatch_logs: body/message at input row %d is too large for PutLogEvents (%d bytes; maximum "
+			    "is %d after per-event overhead)",
+			    event.source_row + 1, event.message.size(), CLOUDWATCH_PUT_MAX_BYTES - CLOUDWATCH_PUT_EVENT_OVERHEAD);
+		}
+	}
+
+	std::stable_sort(events.begin(), events.end(),
+	                 [](const CloudwatchPutLogEvent &left, const CloudwatchPutLogEvent &right) {
+		                 return left.timestamp_ms < right.timestamp_ms;
+	                 });
+
+	vector<CloudwatchPutBatch> batches;
+	idx_t offset = 0;
+	while (offset < events.size()) {
+		idx_t end = offset;
+		idx_t bytes = 0;
+		const auto first_timestamp = events[offset].timestamp_ms;
+		while (end < events.size() && end - offset < CLOUDWATCH_PUT_MAX_EVENTS) {
+			const auto event_bytes = events[end].message.size() + CLOUDWATCH_PUT_EVENT_OVERHEAD;
+			if (end > offset && bytes + event_bytes > CLOUDWATCH_PUT_MAX_BYTES) {
+				break;
+			}
+			// Avoid overflowing first_timestamp + 24h near INT64_MAX. Since events are sorted, a
+			// first timestamp in the final 24h of the int64 range cannot have a later event outside
+			// the span.
+			if (end > offset && first_timestamp <= std::numeric_limits<int64_t>::max() - CLOUDWATCH_PUT_MAX_SPAN_MS &&
+			    events[end].timestamp_ms > first_timestamp + CLOUDWATCH_PUT_MAX_SPAN_MS) {
+				break;
+			}
+			bytes += event_bytes;
+			end++;
+		}
+		batches.push_back({offset, end - offset});
+		offset = end;
+	}
+	return batches;
+}
+
+string BuildCloudwatchPutEventsRequest(const string &log_group, const string &log_stream,
+                                       const CloudwatchPutLogEvent *events, idx_t count) {
+	MutDocPtr doc(yyjson_mut_doc_new(nullptr));
+	auto root = yyjson_mut_obj(doc.get());
+	yyjson_mut_doc_set_root(doc.get(), root);
+	yyjson_mut_obj_add_strncpy(doc.get(), root, "logGroupName", log_group.c_str(), log_group.size());
+	yyjson_mut_obj_add_strncpy(doc.get(), root, "logStreamName", log_stream.c_str(), log_stream.size());
+	auto log_events = yyjson_mut_arr(doc.get());
+	for (idx_t index = 0; index < count; index++) {
+		auto item = yyjson_mut_obj(doc.get());
+		yyjson_mut_obj_add_sint(doc.get(), item, "timestamp", events[index].timestamp_ms);
+		yyjson_mut_obj_add_strncpy(doc.get(), item, "message", events[index].message.c_str(),
+		                           events[index].message.size());
+		yyjson_mut_arr_add_val(log_events, item);
+	}
+	yyjson_mut_obj_add_val(doc.get(), root, "logEvents", log_events);
+	return WriteJson(doc.get());
+}
+
+CloudwatchPutResponse ParseCloudwatchPutEventsResponse(const string &response) {
+	DocPtr doc(yyjson_read(response.c_str(), response.size(), 0));
+	if (!doc) {
+		throw IOException("CloudWatch PutLogEvents returned a response that is not valid JSON");
+	}
+	auto root = yyjson_doc_get_root(doc.get());
+	if (!root || !yyjson_is_obj(root)) {
+		throw IOException("CloudWatch PutLogEvents returned a JSON response that is not an object");
+	}
+
+	CloudwatchPutResponse result;
+	auto rejected = yyjson_obj_get(root, "rejectedLogEventsInfo");
+	if (rejected) {
+		if (!yyjson_is_obj(rejected)) {
+			throw IOException("CloudWatch PutLogEvents returned malformed rejectedLogEventsInfo");
+		}
+		result.has_expired_end = GetInteger(rejected, "expiredLogEventEndIndex", result.expired_end);
+		result.has_too_old_end = GetInteger(rejected, "tooOldLogEventEndIndex", result.too_old_end);
+		result.has_too_new_start = GetInteger(rejected, "tooNewLogEventStartIndex", result.too_new_start);
+	}
+	auto rejected_entity = yyjson_obj_get(root, "rejectedEntityInfo");
+	if (rejected_entity) {
+		if (!yyjson_is_obj(rejected_entity)) {
+			throw IOException("CloudWatch PutLogEvents returned malformed rejectedEntityInfo");
+		}
+		result.has_rejected_entity = true;
+		GetString(rejected_entity, "errorType", result.rejected_entity_error);
+	}
+	return result;
 }
 
 } // namespace duckdb

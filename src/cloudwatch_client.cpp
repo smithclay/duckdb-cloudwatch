@@ -87,6 +87,10 @@ bool IsRetryableStatus(int status, const string &body) {
 	       body.find("ServiceUnavailable") != string::npos;
 }
 
+bool IsDefinitelyRejectedThrottle(int status, const string &body) {
+	return status == 429 || body.find("Throttling") != string::npos;
+}
+
 bool IsExpiredCredentials(int status, const string &body) {
 	return status == 401 || status == 403 ||
 	       (status == 400 &&
@@ -102,6 +106,18 @@ bool IsRetryableTransportError(duckdb_httplib_openssl::Error error) {
 		return false;
 	default:
 		return true;
+	}
+}
+
+bool IsPreSendTransportError(duckdb_httplib_openssl::Error error) {
+	switch (error) {
+	case duckdb_httplib_openssl::Error::Connection:
+	case duckdb_httplib_openssl::Error::ConnectionTimeout:
+	case duckdb_httplib_openssl::Error::BindIPAddress:
+	case duckdb_httplib_openssl::Error::ProxyConnection:
+		return true;
+	default:
+		return false;
 	}
 }
 #endif
@@ -150,6 +166,12 @@ string CloudwatchClient::DescribeLogGroups(ClientContext &context, const string 
 	            request_body);
 }
 
+string CloudwatchClient::PutLogEvents(ClientContext &context, const string &request_body) const {
+	std::lock_guard<std::mutex> write_guard(write_mutex);
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.PutLogEvents", "application/x-amz-json-1.1",
+	            request_body, false);
+}
+
 string CloudwatchClient::DescribeAlarms(ClientContext &context, const string &request_body) const {
 	return Post(context, CloudwatchService::MONITORING, "/", string(),
 	            "application/x-www-form-urlencoded; charset=utf-8", request_body);
@@ -160,7 +182,8 @@ string CloudwatchClient::GetServiceGraph(ClientContext &context, const string &r
 }
 
 string CloudwatchClient::Post(ClientContext &context, CloudwatchService service, const string &path,
-                              const string &target, const string &content_type, const string &request_body) const {
+                              const string &target, const string &content_type, const string &request_body,
+                              bool idempotent) const {
 	bool refreshed_credentials = false;
 	for (uint64_t attempt = 0;; attempt++) {
 		if (context.interrupted) {
@@ -208,7 +231,9 @@ string CloudwatchClient::Post(ClientContext &context, CloudwatchService service,
 			refreshed_credentials = true;
 			continue;
 		}
-		if (attempt >= retries || !response || !IsRetryableStatus(status, body)) {
+		const bool safe_retry =
+		    response && (idempotent ? IsRetryableStatus(status, body) : IsDefinitelyRejectedThrottle(status, body));
+		if (attempt >= retries || !safe_retry) {
 			throw IOException("AWS %s request to %s failed%s%s", AwsServiceName(service), BaseUrl(service),
 			                  status ? StringUtil::Format(" with HTTP %d", status) : string(),
 			                  body.empty() ? string() : ": " + body);
@@ -231,7 +256,8 @@ string CloudwatchClient::Post(ClientContext &context, CloudwatchService service,
 		if (!response) {
 			auto error = response.error();
 			connection.reset();
-			if (attempt >= retries || !IsRetryableTransportError(error)) {
+			const bool safe_retry = idempotent ? IsRetryableTransportError(error) : IsPreSendTransportError(error);
+			if (attempt >= retries || !safe_retry) {
 				throw IOException("AWS %s request to %s failed: %s", AwsServiceName(service), BaseUrl(service),
 				                  duckdb_httplib_openssl::to_string(error));
 			}
@@ -239,7 +265,9 @@ string CloudwatchClient::Post(ClientContext &context, CloudwatchService service,
 			credentials = GetCloudwatchCredentials(context, credentials.secret_name, credentials.region);
 			refreshed_credentials = true;
 			continue;
-		} else if (attempt >= retries || !IsRetryableStatus(response->status, response->body)) {
+		} else if (attempt >= retries ||
+		           !(idempotent ? IsRetryableStatus(response->status, response->body)
+		                        : IsDefinitelyRejectedThrottle(response->status, response->body))) {
 			throw IOException("AWS %s returned HTTP %d: %s", AwsServiceName(service), response->status, response->body);
 		}
 #endif

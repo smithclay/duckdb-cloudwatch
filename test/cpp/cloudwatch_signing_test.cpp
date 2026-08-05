@@ -31,6 +31,12 @@ int main() {
 	result = SignCloudwatchRequest(credentials, "logs.us-east-1.amazonaws.com", "Logs_20140328.DescribeLogGroups", body,
 	                               "20150830T123600Z");
 	assert(result.authorization != filter_authorization);
+	auto describe_authorization = result.authorization;
+	result = SignCloudwatchRequest(credentials, "logs.us-east-1.amazonaws.com", "Logs_20140328.PutLogEvents", body,
+	                               "20150830T123600Z");
+	assert(result.authorization != filter_authorization);
+	assert(result.authorization != describe_authorization);
+	assert(result.authorization.find("SignedHeaders=content-type;host;x-amz-date;x-amz-target") != string::npos);
 
 	credentials.session_token = "temporary-token";
 	result = SignCloudwatchRequest(credentials, "logs.us-east-1.amazonaws.com", "Logs_20140328.FilterLogEvents", body,
