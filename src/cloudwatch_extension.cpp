@@ -4,6 +4,7 @@
 
 #include "cloudwatch_catalog.hpp"
 #include "logs_table.hpp"
+#include "send_logs.hpp"
 #include "service_dependencies.hpp"
 
 #include "duckdb.hpp"
@@ -14,6 +15,7 @@ namespace duckdb {
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterCloudwatchCatalog(loader);
 	RegisterCloudwatchLogsFunction(loader);
+	RegisterCloudwatchSendLogsFunction(loader);
 	RegisterCloudwatchServiceDependenciesFunction(loader);
 }
 

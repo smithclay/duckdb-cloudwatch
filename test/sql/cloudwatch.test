@@ -19,6 +19,39 @@ SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_cloudwa
 ----
 true
 
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'send_cloudwatch_logs';
+----
+true
+
+# The sender validates its OTLP-shaped input and constant destination before credential lookup.
+statement error
+DESCRIBE SELECT send_cloudwatch_logs('not a struct', '/app/logs', 'duckdb');
+----
+must be a STRUCT
+
+statement error
+DESCRIBE SELECT send_cloudwatch_logs({'body': 'hello'}, '', 'duckdb');
+----
+log_group must not be empty
+
+statement error
+DESCRIBE SELECT send_cloudwatch_logs({'body': 'hello'}, '/app/logs', 'bad:*');
+----
+log_stream must not contain
+
+statement error
+DESCRIBE SELECT send_cloudwatch_logs({'body': 'hello'}, log_group, 'duckdb')
+FROM (VALUES ('/app/logs')) destinations(log_group);
+----
+log_group must be a constant string
+
+# With a valid destination, sender credentials resolve from the same aws/s3 secret chain as reads.
+statement error
+DESCRIBE SELECT send_cloudwatch_logs({'body': 'hello'}, '/app/logs', 'duckdb');
+----
+No AWS credentials found
+
 # ATTACH option validation is performed before AWS credential lookup, keeping these catalog
 # tests offline. Successful catalog attachment is covered by the integration smoke test.
 statement error

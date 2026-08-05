@@ -2,6 +2,8 @@
 
 #include "cloudwatch_secret.hpp"
 
+#include <mutex>
+
 #ifndef __EMSCRIPTEN__
 namespace duckdb_httplib_openssl {
 class Client;
@@ -27,6 +29,7 @@ struct CloudwatchClient {
 
 	string FilterLogEvents(ClientContext &context, const string &request_body) const;
 	string DescribeLogGroups(ClientContext &context, const string &request_body) const;
+	string PutLogEvents(ClientContext &context, const string &request_body) const;
 	string DescribeAlarms(ClientContext &context, const string &request_body) const;
 	string GetServiceGraph(ClientContext &context, const string &request_body) const;
 	string BaseUrl(CloudwatchService service = CloudwatchService::LOGS) const;
@@ -34,7 +37,11 @@ struct CloudwatchClient {
 
 private:
 	string Post(ClientContext &context, CloudwatchService service, const string &path, const string &target,
-	            const string &content_type, const string &request_body) const;
+	            const string &content_type, const string &request_body, bool idempotent = true) const;
+	//! Function bind data is shared by DuckDB projection workers. cpp-httplib clients are not safe
+	//! for concurrent use, so writes through this client are serialized. PutLogEvents no longer
+	//! requires sequence-token serialization; this lock protects only the local transport object.
+	mutable std::mutex write_mutex;
 #ifndef __EMSCRIPTEN__
 	mutable unique_ptr<duckdb_httplib_openssl::Client> connection;
 	duckdb_httplib_openssl::Client &GetConnection(CloudwatchService service) const;

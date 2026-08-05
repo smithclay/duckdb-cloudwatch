@@ -1,7 +1,7 @@
 # duckdb-cloudwatch
 
-A native DuckDB 1.5.5 extension that reads Amazon CloudWatch Logs and alarms, plus AWS X-Ray service
-dependencies.
+A native DuckDB 1.5.5 extension that reads and writes Amazon CloudWatch Logs, reads CloudWatch
+alarms, and reads AWS X-Ray service dependencies.
 Rows use the same flat 18-column OTLP log schema as
 [`duckdb-otlp`](https://github.com/smithclay/otlp2records) and the sibling Datadog, Splunk, and
 Google Cloud observability extensions, so telemetry from those sources can be combined with
@@ -123,6 +123,56 @@ accumulated for the whole query. Retry waits check DuckDB's interrupt flag appro
 
 The extension signs every request with AWS Signature Version 4 over HTTPS. It does not follow HTTP
 redirects, which prevents forwarding signed credentials to another origin.
+
+## `send_cloudwatch_logs`
+
+`send_cloudwatch_logs` pushes an OTLP-shaped log table to an existing CloudWatch Logs group and
+stream through [`PutLogEvents`](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_PutLogEvents.html).
+Pass a whole row as the first argument; each accepted row returns `'ok'`:
+
+```sql
+-- Resolve the first unambiguous in-scope aws/s3 secret.
+SELECT send_cloudwatch_logs(l, '/app/orders', 'duckdb-import')
+FROM my_logs l;
+
+-- Or pin a named secret as the fourth argument.
+SELECT send_cloudwatch_logs(l, '/app/orders', 'duckdb-import', 'cw_prod')
+FROM read_cloudwatch_logs('/archive/orders', start_time => '-1h') l;
+```
+
+The log group and stream arguments must be constant strings. That makes the destination explicit,
+lets the function batch rows safely, and avoids turning row data into AWS resource names by
+accident. Both resources must already exist; the sender never creates or mutates groups, streams,
+or retention policies. The optional fourth argument is a constant `aws`/`s3` secret name; region
+and refreshable credentials use the same resolution path as the reader.
+
+CloudWatch exposes only a message and timestamp on each writable event, so the mapping is
+deliberately narrow:
+
+| Struct column (first match wins) | `PutLogEvents` field |
+|---|---|
+| `body` / `message` | `message` (required and non-empty) |
+| `time_unix_nano` / `timestamp` | `timestamp` in epoch milliseconds |
+| `observed_time_unix_nano` | timestamp fallback |
+
+Integer `time_unix_nano` and `observed_time_unix_nano` values are interpreted as epoch
+nanoseconds; an integer `timestamp` is epoch milliseconds. Temporal values are converted precisely
+to milliseconds. If no usable timestamp is present, execution time is used. Other OTLP and unknown
+fields are ignored rather than changing the original message into a JSON envelope. A `NULL` struct
+returns `NULL` and sends nothing.
+
+Rows are stable-sorted by timestamp and split into API-valid batches: at most 10,000 events and
+1,048,576 bytes (UTF-8 message bytes plus AWS's 26-byte charge per event), with no batch spanning
+more than 24 hours. Sequence tokens are intentionally omitted because AWS no longer uses them and
+permits parallel `PutLogEvents` calls to one stream. The local HTTP connection is still serialized
+because DuckDB may evaluate the scalar concurrently and the shared transport is not thread-safe.
+
+Writes are non-idempotent. The client retries only failures known not to have sent request bytes and
+definite throttling responses; ambiguous transport failures and 5xx responses are surfaced to avoid
+silently duplicating logs. AWS can partially accept a request while returning HTTP 200, so any
+`rejectedLogEventsInfo` or rejected entity is reported as an error instead of marking every row
+`'ok'`. Earlier batches may already be stored if a later batch fails. Sending requires
+`logs:PutLogEvents` on the destination stream.
 
 ## Alarms and service dependencies
 
