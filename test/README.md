@@ -16,7 +16,8 @@ make test_debug
 Run the pure C++ helper test with:
 
 ```bash
-cmake --build build/release --target cloudwatch_json_test cloudwatch_signing_test
+cmake --build build/release --target cloudwatch_json_test cloudwatch_signing_test cloudwatch_protocol_test
 ./build/release/extension/cloudwatch/cloudwatch_json_test
 ./build/release/extension/cloudwatch/cloudwatch_signing_test
+./build/release/extension/cloudwatch/cloudwatch_protocol_test
 ```

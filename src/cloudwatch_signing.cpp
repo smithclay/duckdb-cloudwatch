@@ -55,42 +55,60 @@ Bytes HmacSha256(const Bytes &key, const string &value) {
 
 } // namespace
 
-CloudwatchSignedHeaders SignCloudwatchRequest(const CloudwatchCredentials &credentials, const string &host,
-                                              const string &target, const string &body, const string &amz_date) {
-	if (amz_date.size() != 16 || amz_date[8] != 'T' || amz_date.back() != 'Z') {
+CloudwatchSignedHeaders SignCloudwatchRequest(const CloudwatchCredentials &credentials,
+                                              const CloudwatchSigningRequest &request) {
+	if (request.amz_date.size() != 16 || request.amz_date[8] != 'T' || request.amz_date.back() != 'Z') {
 		throw InternalException("CloudWatch signing date must use YYYYMMDDTHHMMSSZ");
 	}
-	const auto date = amz_date.substr(0, 8);
-	const auto credential_scope = date + "/" + credentials.region + "/logs/aws4_request";
+	if (request.service.empty() || request.host.empty() || request.content_type.empty()) {
+		throw InternalException("AWS signing requires a service, host, and content type");
+	}
+	const auto date = request.amz_date.substr(0, 8);
+	const auto credential_scope = date + "/" + credentials.region + "/" + request.service + "/aws4_request";
 
-	string canonical_headers = "content-type:application/x-amz-json-1.1\n";
-	canonical_headers += "host:" + host + "\n";
-	canonical_headers += "x-amz-date:" + amz_date + "\n";
+	string canonical_headers = "content-type:" + request.content_type + "\n";
+	canonical_headers += "host:" + request.host + "\n";
+	canonical_headers += "x-amz-date:" + request.amz_date + "\n";
 	string signed_headers = "content-type;host;x-amz-date";
 	if (!credentials.session_token.empty()) {
 		canonical_headers += "x-amz-security-token:" + credentials.session_token + "\n";
 		signed_headers += ";x-amz-security-token";
 	}
-	canonical_headers += "x-amz-target:" + target + "\n";
-	signed_headers += ";x-amz-target";
+	if (!request.target.empty()) {
+		canonical_headers += "x-amz-target:" + request.target + "\n";
+		signed_headers += ";x-amz-target";
+	}
 
-	const auto canonical_request = "POST\n/\n\n" + canonical_headers + "\n" + signed_headers + "\n" + Sha256Hex(body);
+	const auto canonical_request =
+	    "POST\n" + request.uri + "\n\n" + canonical_headers + "\n" + signed_headers + "\n" + Sha256Hex(request.body);
 	const auto string_to_sign =
-	    "AWS4-HMAC-SHA256\n" + amz_date + "\n" + credential_scope + "\n" + Sha256Hex(canonical_request);
+	    "AWS4-HMAC-SHA256\n" + request.amz_date + "\n" + credential_scope + "\n" + Sha256Hex(canonical_request);
 
 	auto date_key = HmacSha256("AWS4" + credentials.secret_access_key, date);
 	auto region_key = HmacSha256(date_key, credentials.region);
-	auto service_key = HmacSha256(region_key, "logs");
+	auto service_key = HmacSha256(region_key, request.service);
 	auto signing_key = HmacSha256(service_key, "aws4_request");
 	auto signature = HmacSha256(signing_key, string_to_sign);
 
 	CloudwatchSignedHeaders result;
-	result.amz_date = amz_date;
+	result.amz_date = request.amz_date;
 	result.security_token = credentials.session_token;
 	result.authorization = "AWS4-HMAC-SHA256 Credential=" + credentials.access_key_id + "/" + credential_scope +
 	                       ", SignedHeaders=" + signed_headers +
 	                       ", Signature=" + Hex(signature.data(), signature.size());
 	return result;
+}
+
+CloudwatchSignedHeaders SignCloudwatchRequest(const CloudwatchCredentials &credentials, const string &host,
+                                              const string &target, const string &body, const string &amz_date) {
+	CloudwatchSigningRequest request;
+	request.service = "logs";
+	request.host = host;
+	request.content_type = "application/x-amz-json-1.1";
+	request.target = target;
+	request.body = body;
+	request.amz_date = amz_date;
+	return SignCloudwatchRequest(credentials, request);
 }
 
 } // namespace duckdb

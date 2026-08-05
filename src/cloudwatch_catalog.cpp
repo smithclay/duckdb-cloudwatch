@@ -3,7 +3,9 @@
 #include "cloudwatch_client.hpp"
 #include "cloudwatch_json.hpp"
 #include "cloudwatch_secret.hpp"
+#include "alerts_table.hpp"
 #include "logs_table.hpp"
+#include "service_dependencies.hpp"
 
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -172,11 +174,150 @@ private:
 	vector<unique_ptr<CloudwatchTableEntry>> tables;
 };
 
+enum class FixedTableKind : uint8_t { ALERTS_OPEN, SERVICE_DEPENDENCIES };
+
+class CloudwatchFixedTableEntry : public TableCatalogEntry {
+public:
+	CloudwatchFixedTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, string name, FixedTableKind kind,
+	                          string secret_name, const CloudwatchAlertsSettings &alerts_settings,
+	                          const CloudwatchServiceMapSettings &service_map_settings)
+	    : CloudwatchFixedTableEntry(catalog, schema, name, kind, std::move(secret_name), alerts_settings,
+	                                service_map_settings, CreateInfo(schema, name, kind)) {
+	}
+
+	unique_ptr<BaseStatistics> GetStatistics(ClientContext &, column_t) override {
+		return nullptr;
+	}
+
+	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override {
+		if (kind == FixedTableKind::ALERTS_OPEN) {
+			return GetCloudwatchAlertsTableScan(context, *this, secret_name, alerts_settings, bind_data);
+		}
+		return GetCloudwatchServiceDependenciesTableScan(context, *this, secret_name, service_map_settings, bind_data);
+	}
+
+	TableStorageInfo GetStorageInfo(ClientContext &) override {
+		return TableStorageInfo();
+	}
+
+private:
+	CloudwatchFixedTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, string name, FixedTableKind kind,
+	                          string secret_name, const CloudwatchAlertsSettings &alerts_settings,
+	                          const CloudwatchServiceMapSettings &service_map_settings, CreateTableInfo info)
+	    : TableCatalogEntry(catalog, schema, info), kind(kind), secret_name(std::move(secret_name)),
+	      alerts_settings(alerts_settings), service_map_settings(service_map_settings) {
+	}
+
+	static CreateTableInfo CreateInfo(SchemaCatalogEntry &schema, const string &name, FixedTableKind kind) {
+		CreateTableInfo info(schema, name);
+		vector<LogicalType> types;
+		vector<string> names;
+		if (kind == FixedTableKind::ALERTS_OPEN) {
+			GetCloudwatchAlertsSchema(types, names);
+		} else {
+			GetCloudwatchServiceDependenciesSchema(types, names);
+		}
+		for (idx_t i = 0; i < names.size(); i++) {
+			info.columns.AddColumn(ColumnDefinition(names[i], types[i]));
+		}
+		return info;
+	}
+
+	FixedTableKind kind;
+	string secret_name;
+	CloudwatchAlertsSettings alerts_settings;
+	CloudwatchServiceMapSettings service_map_settings;
+};
+
+class CloudwatchFixedSchemaEntry : public SchemaCatalogEntry {
+public:
+	CloudwatchFixedSchemaEntry(Catalog &catalog, string schema_name, string table_name, FixedTableKind kind,
+	                           string secret_name, const CloudwatchAlertsSettings &alerts_settings,
+	                           const CloudwatchServiceMapSettings &service_map_settings)
+	    : CloudwatchFixedSchemaEntry(catalog, schema_name, std::move(table_name), kind, std::move(secret_name),
+	                                 alerts_settings, service_map_settings, CreateInfo(schema_name)) {
+	}
+
+	void Scan(ClientContext &, CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
+		Scan(type, callback);
+	}
+	void Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) override {
+		if (type == CatalogType::TABLE_ENTRY)
+			callback(*table);
+	}
+	optional_ptr<CatalogEntry> LookupEntry(CatalogTransaction, const EntryLookupInfo &lookup_info) override {
+		return lookup_info.GetCatalogType() == CatalogType::TABLE_ENTRY &&
+		               StringUtil::CIEquals(lookup_info.GetEntryName(), table->name)
+		           ? optional_ptr<CatalogEntry>(table.get())
+		           : nullptr;
+	}
+	optional_ptr<CatalogEntry> CreateIndex(CatalogTransaction, CreateIndexInfo &, TableCatalogEntry &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction, CreateFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction, BoundCreateTableInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateView(CatalogTransaction, CreateViewInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateSequence(CatalogTransaction, CreateSequenceInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateTableFunction(CatalogTransaction, CreateTableFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateCopyFunction(CatalogTransaction, CreateCopyFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreatePragmaFunction(CatalogTransaction, CreatePragmaFunctionInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateCollation(CatalogTransaction, CreateCollationInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateCoordinateSystem(CatalogTransaction, CreateCoordinateSystemInfo &) override {
+		ThrowReadOnly();
+	}
+	optional_ptr<CatalogEntry> CreateType(CatalogTransaction, CreateTypeInfo &) override {
+		ThrowReadOnly();
+	}
+	void DropEntry(ClientContext &, DropInfo &) override {
+		ThrowReadOnly();
+	}
+	void Alter(CatalogTransaction, AlterInfo &) override {
+		ThrowReadOnly();
+	}
+
+private:
+	CloudwatchFixedSchemaEntry(Catalog &catalog, string schema_name, string table_name, FixedTableKind kind,
+	                           string secret_name, const CloudwatchAlertsSettings &alerts_settings,
+	                           const CloudwatchServiceMapSettings &service_map_settings, CreateSchemaInfo info)
+	    : SchemaCatalogEntry(catalog, info) {
+		table = make_uniq<CloudwatchFixedTableEntry>(catalog, *this, std::move(table_name), kind,
+		                                             std::move(secret_name), alerts_settings, service_map_settings);
+	}
+	static CreateSchemaInfo CreateInfo(const string &name) {
+		CreateSchemaInfo info;
+		info.schema = name;
+		return info;
+	}
+	unique_ptr<CloudwatchFixedTableEntry> table;
+};
+
 class CloudwatchCatalog : public Catalog {
 public:
 	CloudwatchCatalog(AttachedDatabase &db, vector<string> log_groups, string secret_name,
-	                  const CloudwatchLogsSettings &settings)
-	    : Catalog(db), logs_schema(make_uniq<CloudwatchSchemaEntry>(*this, log_groups, secret_name, settings)) {
+	                  const CloudwatchLogsSettings &settings, const CloudwatchAlertsSettings &alerts_settings,
+	                  const CloudwatchServiceMapSettings &service_map_settings)
+	    : Catalog(db), logs_schema(make_uniq<CloudwatchSchemaEntry>(*this, log_groups, secret_name, settings)),
+	      alerts_schema(make_uniq<CloudwatchFixedSchemaEntry>(*this, "alerts", "open", FixedTableKind::ALERTS_OPEN,
+	                                                          secret_name, alerts_settings, service_map_settings)),
+	      service_map_schema(make_uniq<CloudwatchFixedSchemaEntry>(*this, "service_map", "dependencies",
+	                                                               FixedTableKind::SERVICE_DEPENDENCIES, secret_name,
+	                                                               alerts_settings, service_map_settings)) {
 	}
 
 	void Initialize(bool) override {
@@ -192,6 +333,8 @@ public:
 
 	void ScanSchemas(ClientContext &, std::function<void(SchemaCatalogEntry &)> callback) override {
 		callback(*logs_schema);
+		callback(*alerts_schema);
+		callback(*service_map_schema);
 	}
 
 	optional_ptr<SchemaCatalogEntry> LookupSchema(CatalogTransaction, const EntryLookupInfo &schema_lookup,
@@ -199,6 +342,10 @@ public:
 		if (StringUtil::CIEquals(schema_lookup.GetEntryName(), "logs")) {
 			return logs_schema.get();
 		}
+		if (StringUtil::CIEquals(schema_lookup.GetEntryName(), "alerts"))
+			return alerts_schema.get();
+		if (StringUtil::CIEquals(schema_lookup.GetEntryName(), "service_map"))
+			return service_map_schema.get();
 		if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 			throw CatalogException(schema_lookup.GetErrorContext(), "Schema with name %s does not exist!",
 			                       schema_lookup.GetEntryName());
@@ -239,6 +386,8 @@ private:
 	}
 
 	unique_ptr<CloudwatchSchemaEntry> logs_schema;
+	unique_ptr<CloudwatchFixedSchemaEntry> alerts_schema;
+	unique_ptr<CloudwatchFixedSchemaEntry> service_map_schema;
 };
 
 class CloudwatchTransaction : public Transaction {
@@ -350,7 +499,11 @@ unique_ptr<Catalog> AttachCloudwatch(optional_ptr<StorageExtensionInfo>, ClientC
 	string secret_name;
 	vector<string> log_groups;
 	CloudwatchLogsSettings settings;
+	CloudwatchAlertsSettings alerts_settings;
+	CloudwatchServiceMapSettings service_map_settings;
 	bool groups_supplied = false;
+	bool endpoint_supplied = false;
+	bool logs_endpoint_supplied = false;
 	for (const auto &option : options.options) {
 		auto key = StringUtil::Lower(option.first);
 		if (key == "secret") {
@@ -362,6 +515,22 @@ unique_ptr<Catalog> AttachCloudwatch(optional_ptr<StorageExtensionInfo>, ClientC
 			settings.region = ParseAttachString("REGION", option.second, false);
 		} else if (key == "endpoint") {
 			settings.endpoint = ParseAttachString("ENDPOINT", option.second, false);
+			endpoint_supplied = true;
+		} else if (key == "logs_endpoint") {
+			settings.endpoint = ParseAttachString("LOGS_ENDPOINT", option.second, false);
+			logs_endpoint_supplied = true;
+		} else if (key == "monitoring_endpoint") {
+			alerts_settings.monitoring_endpoint = ParseAttachString("MONITORING_ENDPOINT", option.second, false);
+		} else if (key == "xray_endpoint") {
+			service_map_settings.xray_endpoint = ParseAttachString("XRAY_ENDPOINT", option.second, false);
+		} else if (key == "service_map_start_time") {
+			service_map_settings.start_time = ParseAttachString("SERVICE_MAP_START_TIME", option.second, false);
+		} else if (key == "service_map_end_time") {
+			service_map_settings.end_time = ParseAttachString("SERVICE_MAP_END_TIME", option.second, false);
+		} else if (key == "xray_group_name") {
+			service_map_settings.group_name = ParseAttachString("XRAY_GROUP_NAME", option.second, false);
+		} else if (key == "xray_group_arn") {
+			service_map_settings.group_arn = ParseAttachString("XRAY_GROUP_ARN", option.second, false);
 		} else if (key == "filter") {
 			settings.filter_pattern = ParseAttachString("FILTER", option.second);
 		} else if (key == "start_time") {
@@ -376,8 +545,12 @@ unique_ptr<Catalog> AttachCloudwatch(optional_ptr<StorageExtensionInfo>, ClientC
 			settings.max_rows = ParseAttachInteger("MAX_ROWS", option.second);
 		} else if (key == "retries") {
 			settings.retries = ParseAttachInteger("RETRIES", option.second);
+			alerts_settings.retries = settings.retries;
+			service_map_settings.retries = settings.retries;
 		} else if (key == "timeout") {
 			settings.timeout_seconds = ParseAttachInteger("TIMEOUT", option.second);
+			alerts_settings.timeout_seconds = settings.timeout_seconds;
+			service_map_settings.timeout_seconds = settings.timeout_seconds;
 		} else if (key == "unmask") {
 			if (option.second.IsNull() || option.second.type().id() != LogicalTypeId::BOOLEAN) {
 				throw InvalidInputException("CloudWatch ATTACH option UNMASK must be a non-null BOOLEAN");
@@ -386,11 +559,24 @@ unique_ptr<Catalog> AttachCloudwatch(optional_ptr<StorageExtensionInfo>, ClientC
 		} else {
 			throw InvalidInputException(
 			    "Unsupported CloudWatch ATTACH option '%s'; supported options are SECRET, LOG_GROUPS, REGION, "
-			    "ENDPOINT, FILTER, START_TIME, END_TIME, ORDER, PAGE_SIZE, MAX_ROWS, RETRIES, TIMEOUT, and UNMASK",
+			    "ENDPOINT, LOGS_ENDPOINT, MONITORING_ENDPOINT, XRAY_ENDPOINT, FILTER, START_TIME, END_TIME, "
+			    "SERVICE_MAP_START_TIME, "
+			    "SERVICE_MAP_END_TIME, XRAY_GROUP_NAME, XRAY_GROUP_ARN, ORDER, PAGE_SIZE, MAX_ROWS, RETRIES, TIMEOUT, "
+			    "and UNMASK",
 			    option.first);
 		}
 	}
+	if (endpoint_supplied && logs_endpoint_supplied) {
+		throw InvalidInputException(
+		    "CloudWatch ATTACH options ENDPOINT and LOGS_ENDPOINT are aliases and mutually exclusive");
+	}
 	ValidateCloudwatchLogsSettings(settings, "CloudWatch ATTACH");
+	alerts_settings.region = settings.region;
+	service_map_settings.region = settings.region;
+	CloudwatchLogsSettings monitoring_validation;
+	monitoring_validation.endpoint = alerts_settings.monitoring_endpoint;
+	ValidateCloudwatchLogsSettings(monitoring_validation, "CloudWatch ATTACH MONITORING_ENDPOINT");
+	ValidateCloudwatchServiceMapSettings(service_map_settings, "CloudWatch ATTACH");
 
 	auto credentials = GetCloudwatchCredentials(context, secret_name, settings.region);
 	if (secret_name.empty()) {
@@ -406,7 +592,8 @@ unique_ptr<Catalog> AttachCloudwatch(optional_ptr<StorageExtensionInfo>, ClientC
 	}
 
 	db.SetReadOnlyDatabase();
-	return make_uniq<CloudwatchCatalog>(db, std::move(log_groups), std::move(secret_name), settings);
+	return make_uniq<CloudwatchCatalog>(db, std::move(log_groups), std::move(secret_name), settings, alerts_settings,
+	                                    service_map_settings);
 }
 
 unique_ptr<TransactionManager> CreateCloudwatchTransactionManager(optional_ptr<StorageExtensionInfo>,
