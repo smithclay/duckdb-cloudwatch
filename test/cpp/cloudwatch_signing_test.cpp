@@ -37,5 +37,29 @@ int main() {
 	                               "20150830T123600Z");
 	assert(result.security_token == "temporary-token");
 	assert(result.authorization.find("x-amz-security-token;x-amz-target") != string::npos);
+
+	credentials.session_token.clear();
+	CloudwatchSigningRequest monitoring;
+	monitoring.service = "monitoring";
+	monitoring.host = "monitoring.us-east-1.amazonaws.com";
+	monitoring.content_type = "application/x-www-form-urlencoded; charset=utf-8";
+	monitoring.body = "Action=DescribeAlarms&Version=2010-08-01";
+	monitoring.amz_date = "20150830T123600Z";
+	result = SignCloudwatchRequest(credentials, monitoring);
+	assert(result.authorization.find("/us-east-1/monitoring/aws4_request") != string::npos);
+	assert(result.authorization.find("SignedHeaders=content-type;host;x-amz-date") != string::npos);
+	assert(result.authorization.find("x-amz-target") == string::npos);
+
+	CloudwatchSigningRequest xray;
+	xray.service = "xray";
+	xray.host = "xray.us-east-1.amazonaws.com";
+	xray.content_type = "application/json";
+	xray.uri = "/ServiceGraph";
+	xray.body = R"({"StartTime":1,"EndTime":2})";
+	xray.amz_date = "20150830T123600Z";
+	auto xray_result = SignCloudwatchRequest(credentials, xray);
+	assert(xray_result.authorization.find("/us-east-1/xray/aws4_request") != string::npos);
+	xray.uri = "/";
+	assert(SignCloudwatchRequest(credentials, xray).authorization != xray_result.authorization);
 	return 0;
 }

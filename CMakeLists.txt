@@ -30,7 +30,9 @@ set(EXTENSION_SOURCES
     src/cloudwatch_signing.cpp
     src/cloudwatch_client.cpp
     src/cloudwatch_json.cpp
-    src/logs_table.cpp)
+    src/logs_table.cpp
+    src/alerts_table.cpp
+    src/service_dependencies.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
@@ -61,6 +63,14 @@ target_link_libraries(cloudwatch_signing_test duckdb_static dummy_static_extensi
                                                   OpenSSL::Crypto)
 set_target_properties(
   cloudwatch_signing_test
+  PROPERTIES RUNTIME_OUTPUT_DIRECTORY
+             "${CMAKE_BINARY_DIR}/extension/cloudwatch")
+
+add_executable(cloudwatch_protocol_test EXCLUDE_FROM_ALL test/cpp/cloudwatch_protocol_test.cpp)
+target_include_directories(cloudwatch_protocol_test PRIVATE src/include)
+target_link_libraries(cloudwatch_protocol_test cloudwatch_extension duckdb_static dummy_static_extension_loader)
+set_target_properties(
+  cloudwatch_protocol_test
   PROPERTIES RUNTIME_OUTPUT_DIRECTORY
              "${CMAKE_BINARY_DIR}/extension/cloudwatch")
 

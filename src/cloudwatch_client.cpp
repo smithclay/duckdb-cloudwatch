@@ -22,9 +22,21 @@ namespace duckdb {
 
 namespace {
 
-string DefaultCloudwatchHost(const string &region) {
+string AwsServiceName(CloudwatchService service) {
+	switch (service) {
+	case CloudwatchService::LOGS:
+		return "logs";
+	case CloudwatchService::MONITORING:
+		return "monitoring";
+	case CloudwatchService::XRAY:
+		return "xray";
+	}
+	throw InternalException("Unknown CloudWatch AWS service");
+}
+
+string DefaultCloudwatchHost(const string &region, CloudwatchService service) {
 	auto suffix = StringUtil::StartsWith(region, "cn-") ? "amazonaws.com.cn" : "amazonaws.com";
-	return "logs." + region + "." + suffix;
+	return AwsServiceName(service) + "." + region + "." + suffix;
 }
 
 string TrimEndpoint(string endpoint) {
@@ -75,6 +87,12 @@ bool IsRetryableStatus(int status, const string &body) {
 	       body.find("ServiceUnavailable") != string::npos;
 }
 
+bool IsExpiredCredentials(int status, const string &body) {
+	return status == 401 || status == 403 ||
+	       (status == 400 &&
+	        (body.find("ExpiredToken") != string::npos || body.find("RequestExpired") != string::npos));
+}
+
 #ifndef __EMSCRIPTEN__
 bool IsRetryableTransportError(duckdb_httplib_openssl::Error error) {
 	switch (error) {
@@ -94,9 +112,9 @@ CloudwatchClient::CloudwatchClient() = default;
 CloudwatchClient::~CloudwatchClient() {
 }
 
-string CloudwatchClient::BaseUrl() const {
+string CloudwatchClient::BaseUrl(CloudwatchService service) const {
 	if (endpoint.empty()) {
-		return "https://" + DefaultCloudwatchHost(credentials.region);
+		return "https://" + DefaultCloudwatchHost(credentials.region, service);
 	}
 	auto normalized = TrimEndpoint(endpoint);
 	if (StringUtil::StartsWith(normalized, "http://") || StringUtil::StartsWith(normalized, "https://")) {
@@ -105,14 +123,15 @@ string CloudwatchClient::BaseUrl() const {
 	return "https://" + normalized;
 }
 
-string CloudwatchClient::Host() const {
-	return AuthorityFromUrl(BaseUrl());
+string CloudwatchClient::Host(CloudwatchService service) const {
+	return AuthorityFromUrl(BaseUrl(service));
 }
 
 #ifndef __EMSCRIPTEN__
-duckdb_httplib_openssl::Client &CloudwatchClient::GetConnection() const {
+duckdb_httplib_openssl::Client &CloudwatchClient::GetConnection(CloudwatchService service) const {
 	if (!connection) {
-		connection = make_uniq<duckdb_httplib_openssl::Client>(BaseUrl());
+		// Each client instance is dedicated to one endpoint/service by its owning scan.
+		connection = make_uniq<duckdb_httplib_openssl::Client>(BaseUrl(service));
 		connection->set_connection_timeout(static_cast<time_t>(timeout_seconds), 0);
 		connection->set_read_timeout(static_cast<time_t>(timeout_seconds), 0);
 		connection->set_keep_alive(true);
@@ -122,23 +141,43 @@ duckdb_httplib_openssl::Client &CloudwatchClient::GetConnection() const {
 #endif
 
 string CloudwatchClient::FilterLogEvents(ClientContext &context, const string &request_body) const {
-	return Post(context, "Logs_20140328.FilterLogEvents", request_body);
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.FilterLogEvents", "application/x-amz-json-1.1",
+	            request_body);
 }
 
 string CloudwatchClient::DescribeLogGroups(ClientContext &context, const string &request_body) const {
-	return Post(context, "Logs_20140328.DescribeLogGroups", request_body);
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.DescribeLogGroups", "application/x-amz-json-1.1",
+	            request_body);
 }
 
-string CloudwatchClient::Post(ClientContext &context, const string &target, const string &request_body) const {
+string CloudwatchClient::DescribeAlarms(ClientContext &context, const string &request_body) const {
+	return Post(context, CloudwatchService::MONITORING, "/", string(),
+	            "application/x-www-form-urlencoded; charset=utf-8", request_body);
+}
+
+string CloudwatchClient::GetServiceGraph(ClientContext &context, const string &request_body) const {
+	return Post(context, CloudwatchService::XRAY, "/ServiceGraph", string(), "application/json", request_body);
+}
+
+string CloudwatchClient::Post(ClientContext &context, CloudwatchService service, const string &path,
+                              const string &target, const string &content_type, const string &request_body) const {
 	bool refreshed_credentials = false;
 	for (uint64_t attempt = 0;; attempt++) {
 		if (context.interrupted) {
 			throw InterruptException();
 		}
-		auto signed_headers = SignCloudwatchRequest(credentials, Host(), target, request_body, CurrentAmzDate());
+		CloudwatchSigningRequest signing_request;
+		signing_request.service = AwsServiceName(service);
+		signing_request.host = Host(service);
+		signing_request.content_type = content_type;
+		signing_request.target = target;
+		signing_request.uri = path;
+		signing_request.body = request_body;
+		signing_request.amz_date = CurrentAmzDate();
+		auto signed_headers = SignCloudwatchRequest(credentials, signing_request);
 
 #ifdef __EMSCRIPTEN__
-		auto url = BaseUrl() + "/";
+		auto url = BaseUrl(service) + path;
 		auto &http_util = HTTPUtil::Get(*context.db);
 		auto params = http_util.InitializeParameters(context, url);
 		params->timeout = timeout_seconds;
@@ -148,8 +187,10 @@ string CloudwatchClient::Post(ClientContext &context, const string &target, cons
 		HTTPHeaders headers;
 		headers.Insert("Authorization", signed_headers.authorization);
 		headers.Insert("X-Amz-Date", signed_headers.amz_date);
-		headers.Insert("X-Amz-Target", target);
-		headers.Insert("Content-Type", "application/x-amz-json-1.1");
+		if (!target.empty()) {
+			headers.Insert("X-Amz-Target", target);
+		}
+		headers.Insert("Content-Type", content_type);
 		if (!signed_headers.security_token.empty()) {
 			headers.Insert("X-Amz-Security-Token", signed_headers.security_token);
 		}
@@ -162,13 +203,13 @@ string CloudwatchClient::Post(ClientContext &context, const string &target, cons
 		}
 		auto status = response ? static_cast<int>(response->status) : 0;
 		auto body = response ? response->body : string();
-		if ((status == 401 || status == 403) && !refreshed_credentials) {
+		if (IsExpiredCredentials(status, body) && !refreshed_credentials) {
 			credentials = GetCloudwatchCredentials(context, credentials.secret_name, credentials.region);
 			refreshed_credentials = true;
 			continue;
 		}
 		if (attempt >= retries || !response || !IsRetryableStatus(status, body)) {
-			throw IOException("CloudWatch Logs request to %s failed%s%s", BaseUrl(),
+			throw IOException("AWS %s request to %s failed%s%s", AwsServiceName(service), BaseUrl(service),
 			                  status ? StringUtil::Format(" with HTTP %d", status) : string(),
 			                  body.empty() ? string() : ": " + body);
 		}
@@ -176,12 +217,14 @@ string CloudwatchClient::Post(ClientContext &context, const string &target, cons
 		duckdb_httplib_openssl::Headers headers = {
 		    {"Authorization", signed_headers.authorization},
 		    {"X-Amz-Date", signed_headers.amz_date},
-		    {"X-Amz-Target", target},
 		};
+		if (!target.empty()) {
+			headers.emplace("X-Amz-Target", target);
+		}
 		if (!signed_headers.security_token.empty()) {
 			headers.emplace("X-Amz-Security-Token", signed_headers.security_token);
 		}
-		auto response = GetConnection().Post("/", headers, request_body, "application/x-amz-json-1.1");
+		auto response = GetConnection(service).Post(path, headers, request_body, content_type);
 		if (response && response->status >= 200 && response->status < 300) {
 			return response->body;
 		}
@@ -189,15 +232,15 @@ string CloudwatchClient::Post(ClientContext &context, const string &target, cons
 			auto error = response.error();
 			connection.reset();
 			if (attempt >= retries || !IsRetryableTransportError(error)) {
-				throw IOException("CloudWatch Logs request to %s failed: %s", BaseUrl(),
+				throw IOException("AWS %s request to %s failed: %s", AwsServiceName(service), BaseUrl(service),
 				                  duckdb_httplib_openssl::to_string(error));
 			}
-		} else if ((response->status == 401 || response->status == 403) && !refreshed_credentials) {
+		} else if (IsExpiredCredentials(response->status, response->body) && !refreshed_credentials) {
 			credentials = GetCloudwatchCredentials(context, credentials.secret_name, credentials.region);
 			refreshed_credentials = true;
 			continue;
 		} else if (attempt >= retries || !IsRetryableStatus(response->status, response->body)) {
-			throw IOException("CloudWatch Logs returned HTTP %d: %s", response->status, response->body);
+			throw IOException("AWS %s returned HTTP %d: %s", AwsServiceName(service), response->status, response->body);
 		}
 #endif
 		SleepCheckingInterrupt(context, RetryDelay(attempt));

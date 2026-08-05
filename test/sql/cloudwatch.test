@@ -14,6 +14,11 @@ SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_cloudwa
 ----
 true
 
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_cloudwatch_service_dependencies';
+----
+true
+
 # ATTACH option validation is performed before AWS credential lookup, keeping these catalog
 # tests offline. Successful catalog attachment is covered by the integration smoke test.
 statement error
@@ -35,6 +40,35 @@ statement error
 ATTACH 'cloudwatch:' AS cw_bad_option (TYPE cloudwatch, LOG_GROUPS []::VARCHAR[], UNKNOWN 'value');
 ----
 Unsupported CloudWatch ATTACH option 'unknown'
+
+statement error
+ATTACH 'cloudwatch:' AS cw_bad_xray_group (
+    TYPE cloudwatch,
+    LOG_GROUPS []::VARCHAR[],
+    XRAY_GROUP_NAME 'production',
+    XRAY_GROUP_ARN 'arn:aws:xray:us-east-1:123456789012:group/production/example'
+);
+----
+mutually exclusive
+
+statement error
+ATTACH 'cloudwatch:' AS cw_bad_monitoring_endpoint (
+    TYPE cloudwatch,
+    LOG_GROUPS []::VARCHAR[],
+    MONITORING_ENDPOINT 'ftp://monitoring.example.test'
+);
+----
+endpoint scheme must be HTTP or HTTPS
+
+statement error
+ATTACH 'cloudwatch:' AS cw_ambiguous_logs_endpoint (
+    TYPE cloudwatch,
+    LOG_GROUPS []::VARCHAR[],
+    ENDPOINT 'https://logs.us-east-1.amazonaws.com',
+    LOGS_ENDPOINT 'https://logs.us-west-2.amazonaws.com'
+);
+----
+aliases and mutually exclusive
 
 # Credentials are resolved at bind time and use DuckDB's AWS secret format.
 statement error
@@ -110,3 +144,23 @@ statement error
 SELECT * FROM read_cloudwatch_logs('/aws/lambda/example', endpoint => 'http://logs.example.test');
 ----
 plaintext HTTP endpoints are allowed only on loopback
+
+statement error
+SELECT * FROM read_cloudwatch_service_dependencies(group_name => 'production', group_arn => 'arn:group');
+----
+mutually exclusive
+
+statement error
+SELECT * FROM read_cloudwatch_service_dependencies(retries => -1);
+----
+retries must be between 0 and 100
+
+statement error
+SELECT * FROM read_cloudwatch_service_dependencies(timeout => 0);
+----
+timeout must be >= 1 second
+
+statement error
+SELECT * FROM read_cloudwatch_service_dependencies(xray_endpoint => 'https://xray.example.test/path');
+----
+endpoint must be an origin

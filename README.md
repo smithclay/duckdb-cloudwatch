@@ -1,6 +1,7 @@
 # duckdb-cloudwatch
 
-A native DuckDB 1.5.5 extension that reads Amazon CloudWatch Logs through the `FilterLogEvents` API.
+A native DuckDB 1.5.5 extension that reads Amazon CloudWatch Logs and alarms, plus AWS X-Ray service
+dependencies.
 Rows use the same flat 18-column OTLP log schema as
 [`duckdb-otlp`](https://github.com/smithclay/otlp2records) and the sibling Datadog, Splunk, and
 Google Cloud observability extensions, so telemetry from those sources can be combined with
@@ -45,6 +46,10 @@ ATTACH 'cloudwatch:' AS cw (
 SELECT time_unix_nano, body
 FROM cw.logs."/aws/lambda/orders-api"
 LIMIT 100;
+
+-- Lazy API-backed operational views.
+SELECT * FROM cw.alerts.open;
+SELECT * FROM cw.service_map.dependencies;
 ```
 
 Explicit `LOG_GROUPS` makes `ATTACH` deterministic and performs no network request. When it is
@@ -68,8 +73,12 @@ ATTACH 'cloudwatch:' AS recent_errors (
 );
 ```
 
-Supported options are `SECRET`, `LOG_GROUPS`, `REGION`, `ENDPOINT`, `FILTER`, `START_TIME`,
-`END_TIME`, `ORDER`, `PAGE_SIZE`, `MAX_ROWS`, `RETRIES`, `TIMEOUT`, and `UNMASK`. The selected AWS
+Supported options are `SECRET`, `LOG_GROUPS`, `REGION`, `ENDPOINT`, `LOGS_ENDPOINT`, `MONITORING_ENDPOINT`,
+`XRAY_ENDPOINT`, `FILTER`, `START_TIME`, `END_TIME`, `SERVICE_MAP_START_TIME`,
+`SERVICE_MAP_END_TIME`, `XRAY_GROUP_NAME`, `XRAY_GROUP_ARN`, `ORDER`, `PAGE_SIZE`, `MAX_ROWS`,
+`RETRIES`, `TIMEOUT`, and `UNMASK`. `ENDPOINT` remains a backward-compatible alias for
+`LOGS_ENDPOINT`; the monitoring
+and X-Ray overrides are intentionally separate. The selected AWS
 secret name is pinned at `ATTACH`, while its resolved credentials are fetched again when a catalog
 table is bound. The catalog rejects DDL and DML.
 
@@ -115,6 +124,40 @@ accumulated for the whole query. Retry waits check DuckDB's interrupt flag appro
 The extension signs every request with AWS Signature Version 4 over HTTPS. It does not follow HTTP
 redirects, which prevents forwarding signed credentials to another origin.
 
+## Alarms and service dependencies
+
+`cw.alerts.open` lazily calls `DescribeAlarms` and returns metric, composite, and log alarms whose
+state is `ALARM` or `INSUFFICIENT_DATA`. It includes alarm identity, timestamps, reason data,
+actions, metric fields, dimensions JSON, and the complete type-specific configuration as JSON.
+Scanning requires `cloudwatch:DescribeAlarms`.
+
+X-Ray dependencies are available through both the catalog and a table function:
+
+```sql
+SELECT * FROM cw.service_map.dependencies;
+
+SELECT *
+FROM read_cloudwatch_service_dependencies(
+    start_time => '-15m',
+    end_time   => 'now',
+    group_name => 'production',
+    secret     => 'cw_prod'
+);
+```
+
+The catalog defaults to the latest hour; relative times are evaluated when the table is scanned.
+Set `SERVICE_MAP_START_TIME`, `SERVICE_MAP_END_TIME`, and optionally one of `XRAY_GROUP_NAME` or
+`XRAY_GROUP_ARN` on `ATTACH`. The function accepts the equivalent `start_time`, `end_time`,
+`group_name`, and `group_arn` parameters, plus `secret`, `region`, `xray_endpoint`, `retries`, and
+`timeout`. It follows all `GetServiceGraph` pages before resolving directed edges so references to
+services on later pages are preserved. Scanning requires `xray:GetServiceGraph`.
+
+Both service-map SQL surfaces return: `provider`, `source_service`, `target_service`, `source_type`,
+`target_type`, `edge_type`, `environment`, `window_start`, `window_end`, `request_count`,
+`error_count`, `fault_count`, `throttle_count`, `total_response_time_seconds`, `source_attributes`,
+`target_attributes`, and `edge_attributes`. Attribute columns are JSON strings; `environment` is
+`NULL` for CloudWatch/X-Ray.
+
 ## Output mapping
 
 The output columns are:
@@ -151,6 +194,8 @@ cmake --build build/release --target cloudwatch_json_test
 ./build/release/extension/cloudwatch/cloudwatch_json_test
 cmake --build build/release --target cloudwatch_signing_test
 ./build/release/extension/cloudwatch/cloudwatch_signing_test
+cmake --build build/release --target cloudwatch_protocol_test
+./build/release/extension/cloudwatch/cloudwatch_protocol_test
 ```
 
 The extension currently targets native DuckDB builds. Its distribution workflow excludes WASM
