@@ -48,6 +48,8 @@ int main() {
 	    R"(<DescribeAlarmsResponse><DescribeAlarmsResult><MetricAlarms><member><AlarmName>waiting</AlarmName><StateValue>INSUFFICIENT_DATA</StateValue></member></MetricAlarms></DescribeAlarmsResult></DescribeAlarmsResponse>)",
 	    "INSUFFICIENT_DATA");
 	assert(insufficient.names.size() == 1 && insufficient.names[0] == "waiting");
+	assert(!CloudwatchAlarmPaginationHasCycleForTest({"A", "B", ""}));
+	assert(CloudwatchAlarmPaginationHasCycleForTest({"A", "B", "A"}));
 	bool malformed_xml_failed = false;
 	try {
 		ParseCloudwatchDescribeAlarmsResponseForTest("<broken>", "ALARM");
@@ -89,6 +91,13 @@ int main() {
 	assert(missing.size() == 1);
 	assert(!missing[0].has_statistics);
 	assert(missing[0].target_service == "external");
+	const string missing_reference_ids =
+	    R"({"Services":[{"Name":"unreferenced"},{"ReferenceId":4,"Name":"source","Edges":[{"Aliases":[{"Name":"alias-target","Type":"remote"}]}]}]})";
+	auto alias_backed = ParseCloudwatchServiceGraphResponsesForTest({missing_reference_ids});
+	assert(alias_backed.size() == 1);
+	assert(alias_backed[0].target_service == "alias-target");
+	assert(!CloudwatchServiceGraphPaginationHasCycleForTest({"A", "B", ""}));
+	assert(CloudwatchServiceGraphPaginationHasCycleForTest({"A", "B", "A"}));
 	bool malformed_json_failed = false;
 	try {
 		ParseCloudwatchServiceGraphResponsesForTest({"{"});

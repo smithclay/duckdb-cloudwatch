@@ -19,6 +19,7 @@
 #include <limits>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace duckdb_yyjson; // NOLINT
 
@@ -84,7 +85,8 @@ string WriteDocument(yyjson_mut_doc *doc) {
 }
 
 struct XrayEdge {
-	int64_t reference_id = -1;
+	int64_t reference_id = 0;
+	bool has_reference_id = false;
 	string alias_name;
 	string alias_type;
 	string edge_type;
@@ -98,7 +100,8 @@ struct XrayEdge {
 };
 
 struct XrayService {
-	int64_t reference_id = -1;
+	int64_t reference_id = 0;
+	bool has_reference_id = false;
 	string name;
 	string type;
 	string attributes;
@@ -123,7 +126,11 @@ string BuildAttributes(yyjson_val *object, const vector<const char *> &keys) {
 }
 
 void ParseEdge(yyjson_val *value, XrayEdge &edge) {
-	edge.reference_id = GetInteger(value, "ReferenceId", -1);
+	auto reference_id = yyjson_obj_get(value, "ReferenceId");
+	if (reference_id && yyjson_is_num(reference_id)) {
+		edge.reference_id = GetInteger(value, "ReferenceId");
+		edge.has_reference_id = true;
+	}
 	auto edge_type = GetString(value, "EdgeType");
 	if (!edge_type) {
 		edge_type = GetString(value, "Type");
@@ -151,7 +158,11 @@ void ParseEdge(yyjson_val *value, XrayEdge &edge) {
 }
 
 void ParseService(yyjson_val *value, XrayService &service) {
-	service.reference_id = GetInteger(value, "ReferenceId", -1);
+	auto reference_id = yyjson_obj_get(value, "ReferenceId");
+	if (reference_id && yyjson_is_num(reference_id)) {
+		service.reference_id = GetInteger(value, "ReferenceId");
+		service.has_reference_id = true;
+	}
 	auto name = GetString(value, "Name");
 	auto type = GetString(value, "Type");
 	service.name = name ? name : string();
@@ -312,15 +323,20 @@ struct ServiceDependenciesGlobalState : public GlobalTableFunctionState {
 
 void ResolveGraph(const vector<XrayService> &services, std::deque<ServiceEdgeRow> &rows);
 
+bool IsRepeatedServiceGraphToken(const string &token, std::unordered_set<string> &seen_tokens) {
+	return !token.empty() && !seen_tokens.insert(token).second;
+}
+
 void LoadGraph(ClientContext &context, const ServiceDependenciesBindData &bind, ServiceDependenciesGlobalState &state) {
 	vector<XrayService> services;
 	string next_token;
+	std::unordered_set<string> seen_tokens;
 	for (;;) {
 		auto response = bind.client.GetServiceGraph(
 		    context, BuildServiceGraphRequest(state.start_ms, state.end_ms, bind.settings.group_name,
 		                                      bind.settings.group_arn, next_token));
 		auto next = ParseServiceGraphResponse(response, services);
-		if (next.empty() || next == next_token) {
+		if (next.empty() || IsRepeatedServiceGraphToken(next, seen_tokens)) {
 			break;
 		}
 		next_token = std::move(next);
@@ -331,8 +347,11 @@ void LoadGraph(ClientContext &context, const ServiceDependenciesBindData &bind, 
 
 void ResolveGraph(const vector<XrayService> &services, std::deque<ServiceEdgeRow> &rows) {
 	std::unordered_map<int64_t, const XrayService *> by_reference;
-	for (const auto &service : services)
-		by_reference[service.reference_id] = &service;
+	for (const auto &service : services) {
+		if (service.has_reference_id) {
+			by_reference[service.reference_id] = &service;
+		}
+	}
 	for (const auto &source : services) {
 		for (const auto &edge : source.edges) {
 			ServiceEdgeRow row;
@@ -347,7 +366,7 @@ void ResolveGraph(const vector<XrayService> &services, std::deque<ServiceEdgeRow
 			row.has_statistics = edge.has_statistics;
 			row.source_attributes = source.attributes;
 			row.edge_attributes = edge.attributes;
-			auto target = by_reference.find(edge.reference_id);
+			auto target = edge.has_reference_id ? by_reference.find(edge.reference_id) : by_reference.end();
 			if (target != by_reference.end()) {
 				row.target_service = target->second->name;
 				row.target_type = target->second->type;
@@ -599,6 +618,19 @@ ParseCloudwatchServiceGraphResponsesForTest(const vector<string> &responses) {
 		result.push_back(std::move(value));
 	}
 	return result;
+}
+
+bool CloudwatchServiceGraphPaginationHasCycleForTest(const vector<string> &tokens) {
+	std::unordered_set<string> seen_tokens;
+	for (const auto &token : tokens) {
+		if (token.empty()) {
+			return false;
+		}
+		if (IsRepeatedServiceGraphToken(token, seen_tokens)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 } // namespace duckdb

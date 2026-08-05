@@ -36,6 +36,7 @@ string BuildCloudwatchServiceGraphRequestForTest(int64_t start_ms, int64_t end_m
                                                  const string &group_arn, const string &next_token);
 vector<CloudwatchServiceDependencyProtocolRow>
 ParseCloudwatchServiceGraphResponsesForTest(const vector<string> &responses);
+bool CloudwatchServiceGraphPaginationHasCycleForTest(const vector<string> &tokens);
 
 void RegisterCloudwatchServiceDependenciesFunction(ExtensionLoader &loader);
 void GetCloudwatchServiceDependenciesSchema(vector<LogicalType> &types, vector<string> &names);

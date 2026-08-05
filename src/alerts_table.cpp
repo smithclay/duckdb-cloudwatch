@@ -463,10 +463,15 @@ struct AlertsGlobalState : public GlobalTableFunctionState {
 	idx_t state_index = 0;
 	bool finished = false;
 	std::unordered_set<string> seen;
+	std::unordered_set<string> seen_page_tokens;
 	idx_t MaxThreads() const override {
 		return 1;
 	}
 };
+
+bool IsRepeatedAlarmToken(const string &token, std::unordered_set<string> &seen_tokens) {
+	return !token.empty() && !seen_tokens.insert(token).second;
+}
 
 void FetchAlarmsPage(ClientContext &context, const AlertsBindData &bind, AlertsGlobalState &state) {
 	static const vector<string> states = {"ALARM", "INSUFFICIENT_DATA"};
@@ -484,9 +489,10 @@ void FetchAlarmsPage(ClientContext &context, const AlertsBindData &bind, AlertsG
 			state.buffer.push_back(std::move(row));
 		}
 	}
-	if (next.empty() || next == state.next_token) {
+	if (next.empty() || IsRepeatedAlarmToken(next, state.seen_page_tokens)) {
 		state.state_index++;
 		state.next_token.clear();
+		state.seen_page_tokens.clear();
 		if (state.state_index >= states.size()) {
 			state.finished = true;
 		}
@@ -637,6 +643,19 @@ CloudwatchAlarmProtocolResult ParseCloudwatchDescribeAlarmsResponseForTest(const
 		result.reason_data.push_back(alarm.reason_data);
 	}
 	return result;
+}
+
+bool CloudwatchAlarmPaginationHasCycleForTest(const vector<string> &tokens) {
+	std::unordered_set<string> seen_tokens;
+	for (const auto &token : tokens) {
+		if (token.empty()) {
+			return false;
+		}
+		if (IsRepeatedAlarmToken(token, seen_tokens)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 } // namespace duckdb

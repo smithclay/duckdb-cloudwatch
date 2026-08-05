@@ -29,6 +29,7 @@ struct CloudwatchAlarmProtocolResult {
 string BuildCloudwatchDescribeAlarmsRequestForTest(const string &state, const string &next_token);
 CloudwatchAlarmProtocolResult ParseCloudwatchDescribeAlarmsResponseForTest(const string &response,
                                                                            const string &expected_state);
+bool CloudwatchAlarmPaginationHasCycleForTest(const vector<string> &tokens);
 
 void GetCloudwatchAlertsSchema(vector<LogicalType> &types, vector<string> &names);
 TableFunction GetCloudwatchAlertsTableScan(ClientContext &context, TableCatalogEntry &table, const string &secret_name,
