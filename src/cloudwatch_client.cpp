@@ -177,6 +177,11 @@ string CloudwatchClient::DescribeAlarms(ClientContext &context, const string &re
 	            "application/x-www-form-urlencoded; charset=utf-8", request_body);
 }
 
+string CloudwatchClient::GetMetricData(ClientContext &context, const string &request_body) const {
+	return Post(context, CloudwatchService::MONITORING, "/", "GraniteServiceVersion20100801.GetMetricData",
+	            "application/x-amz-json-1.1", request_body);
+}
+
 string CloudwatchClient::GetServiceGraph(ClientContext &context, const string &request_body) const {
 	return Post(context, CloudwatchService::XRAY, "/ServiceGraph", string(), "application/json", request_body);
 }
