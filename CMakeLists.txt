@@ -31,6 +31,7 @@ set(EXTENSION_SOURCES
     src/cloudwatch_client.cpp
     src/cloudwatch_json.cpp
     src/logs_table.cpp
+	 src/metrics_table.cpp
     src/send_logs.cpp
     src/alerts_table.cpp
     src/service_dependencies.cpp)

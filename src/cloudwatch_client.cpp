@@ -4,7 +4,10 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/main/client_context.hpp"
+
+#include "yyjson.hpp"
 
 #ifdef __EMSCRIPTEN__
 #include "duckdb/common/http_util.hpp"
@@ -17,10 +20,221 @@
 #include <iomanip>
 #include <sstream>
 #include <thread>
+#include <regex>
 
 namespace duckdb {
 
 namespace {
+
+using namespace duckdb_yyjson; // NOLINT
+
+string QueryEncode(const string &value) {
+	static constexpr char HEX[] = "0123456789ABCDEF";
+	string result;
+	for (auto character : value) {
+		auto byte = static_cast<unsigned char>(character);
+		if ((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') ||
+		    byte == '-' || byte == '_' || byte == '.' || byte == '~') {
+			result += static_cast<char>(byte);
+		} else {
+			result += '%';
+			result += HEX[byte >> 4];
+			result += HEX[byte & 0x0F];
+		}
+	}
+	return result;
+}
+
+string FormatQueryTimestamp(int64_t epoch_seconds) {
+	auto time = std::time_t(epoch_seconds);
+	std::tm utc {};
+#ifdef _WIN32
+	gmtime_s(&utc, &time);
+#else
+	gmtime_r(&time, &utc);
+#endif
+	std::ostringstream output;
+	output << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
+	return output.str();
+}
+
+void AppendQueryValue(vector<string> &parts, yyjson_val *value, const string &prefix) {
+	if (yyjson_is_obj(value)) {
+		size_t index, max;
+		yyjson_val *key, *child;
+		yyjson_obj_foreach(value, index, max, key, child) {
+			auto name = prefix.empty() ? string(yyjson_get_str(key)) : prefix + "." + yyjson_get_str(key);
+			AppendQueryValue(parts, child, name);
+		}
+		return;
+	}
+	if (yyjson_is_arr(value)) {
+		for (size_t index = 0; index < yyjson_arr_size(value); index++) {
+			AppendQueryValue(parts, yyjson_arr_get(value, index),
+			                 prefix + ".member." + std::to_string(index + 1));
+		}
+		return;
+	}
+	string text;
+	if (yyjson_is_str(value)) {
+		text = yyjson_get_str(value);
+	} else if (yyjson_is_bool(value)) {
+		text = yyjson_get_bool(value) ? "true" : "false";
+	} else if (yyjson_is_int(value)) {
+		auto integer = yyjson_get_sint(value);
+		text = (prefix == "StartTime" || prefix == "EndTime") ? FormatQueryTimestamp(integer) : std::to_string(integer);
+	} else if (yyjson_is_real(value)) {
+		text = std::to_string(yyjson_get_real(value));
+	} else {
+		throw IOException("CloudWatch GetMetricData request contains an unsupported JSON value for %s", prefix);
+	}
+	parts.push_back(QueryEncode(prefix) + "=" + QueryEncode(text));
+}
+
+string BuildGetMetricDataQueryBody(const string &json_body) {
+	auto document = yyjson_read(json_body.c_str(), json_body.size(), 0);
+	if (!document) {
+		throw IOException("CloudWatch GetMetricData request could not be encoded");
+	}
+	auto root = yyjson_doc_get_root(document);
+	vector<string> parts = {"Action=GetMetricData", "Version=2010-08-01"};
+	try {
+		if (!root || !yyjson_is_obj(root)) {
+			yyjson_doc_free(document);
+			throw IOException("CloudWatch GetMetricData request must be a JSON object");
+		}
+		AppendQueryValue(parts, root, string());
+	} catch (...) {
+		yyjson_doc_free(document);
+		throw;
+	}
+	yyjson_doc_free(document);
+	return StringUtil::Join(parts, "&");
+}
+
+string XmlText(const string &xml, const string &tag) {
+	auto begin = xml.find("<" + tag + ">");
+	if (begin == string::npos) {
+		return string();
+	}
+	begin += tag.size() + 2;
+	auto end = xml.find("</" + tag + ">", begin);
+	return end == string::npos ? string() : xml.substr(begin, end - begin);
+}
+
+vector<string> XmlMembers(const string &xml) {
+	vector<string> result;
+	static const std::regex member("<member>([\\s\\S]*?)</member>");
+	for (std::sregex_iterator item(xml.begin(), xml.end(), member), end; item != end; ++item) {
+		result.push_back((*item)[1].str());
+	}
+	return result;
+}
+
+string XmlFirstMember(const string &xml) {
+	auto begin = xml.find("<member>");
+	if (begin == string::npos) {
+		return string();
+	}
+	auto content_begin = begin + string("<member>").size();
+	auto position = begin;
+	idx_t depth = 0;
+	while (position != string::npos) {
+		auto open = xml.find("<member>", position);
+		auto close = xml.find("</member>", position);
+		if (open != string::npos && (close == string::npos || open < close)) {
+			depth++;
+			position = open + string("<member>").size();
+		} else if (close != string::npos) {
+			if (--depth == 0) {
+				return xml.substr(content_begin, close - content_begin);
+			}
+			position = close + string("</member>").size();
+		} else {
+			break;
+		}
+	}
+	throw IOException("CloudWatch GetMetricData returned malformed XML member nesting");
+}
+
+double XmlTimestampSeconds(const string &value) {
+	timestamp_t timestamp;
+	bool has_offset = false;
+	string_t timezone;
+	int32_t sub_micro_nanos = 0;
+	if (Timestamp::TryConvertTimestampTZ(value.c_str(), value.size(), timestamp, true, has_offset, timezone,
+	                                     &sub_micro_nanos) != TimestampCastResult::SUCCESS) {
+		throw IOException("CloudWatch GetMetricData returned malformed timestamp '%s'", value);
+	}
+	int64_t nanos;
+	if (!Timestamp::TryGetEpochNanoSeconds(timestamp, nanos)) {
+		throw IOException("CloudWatch GetMetricData returned an out-of-range timestamp '%s'", value);
+	}
+	return static_cast<double>(nanos + sub_micro_nanos) / 1000000000.0;
+}
+
+string ConvertGetMetricDataXml(const string &response) {
+	if (response.empty() || response.front() != '<') {
+		return response;
+	}
+	auto result_container = XmlText(response, "MetricDataResults");
+	if (result_container.empty()) {
+		throw IOException("CloudWatch GetMetricData returned XML without MetricDataResults");
+	}
+	auto result = XmlFirstMember(result_container);
+	if (result.empty()) {
+		throw IOException("CloudWatch GetMetricData returned XML with no metric data result members");
+	}
+
+	auto document = yyjson_mut_doc_new(nullptr);
+	auto root = yyjson_mut_obj(document);
+	yyjson_mut_doc_set_root(document, root);
+	auto result_array = yyjson_mut_arr(document);
+	{
+		auto timestamps = XmlMembers(XmlText(result, "Timestamps"));
+		auto values = XmlMembers(XmlText(result, "Values"));
+		if (timestamps.size() != values.size()) {
+			yyjson_mut_doc_free(document);
+			throw IOException("CloudWatch GetMetricData returned mismatched timestamp/value arrays");
+		}
+		auto object = yyjson_mut_obj(document);
+		for (const auto &key : {"Id", "Label", "StatusCode"}) {
+			auto value = XmlText(result, key);
+			if (!value.empty()) {
+				yyjson_mut_obj_add_strcpy(document, object, key, value.c_str());
+			}
+		}
+		auto json_timestamps = yyjson_mut_arr(document);
+		auto json_values = yyjson_mut_arr(document);
+		for (idx_t index = 0; index < timestamps.size(); index++) {
+			char *end = nullptr;
+			auto value = std::strtod(values[index].c_str(), &end);
+			if (!end || *end != '\0') {
+				yyjson_mut_doc_free(document);
+				throw IOException("CloudWatch GetMetricData returned malformed value '%s'", values[index]);
+			}
+			yyjson_mut_arr_add_real(document, json_timestamps, XmlTimestampSeconds(timestamps[index]));
+			yyjson_mut_arr_add_real(document, json_values, value);
+		}
+		yyjson_mut_obj_add_val(document, object, "Timestamps", json_timestamps);
+		yyjson_mut_obj_add_val(document, object, "Values", json_values);
+		yyjson_mut_arr_add_val(result_array, object);
+	}
+	yyjson_mut_obj_add_val(document, root, "MetricDataResults", result_array);
+	auto token = XmlText(response, "NextToken");
+	if (!token.empty()) {
+		yyjson_mut_obj_add_strcpy(document, root, "NextToken", token.c_str());
+	}
+	size_t size = 0;
+	auto serialized = yyjson_mut_write(document, 0, &size);
+	yyjson_mut_doc_free(document);
+	if (!serialized) {
+		throw IOException("CloudWatch GetMetricData XML response could not be converted");
+	}
+	string converted(serialized, size);
+	free(serialized);
+	return converted;
+}
 
 string AwsServiceName(CloudwatchService service) {
 	switch (service) {
@@ -177,6 +391,12 @@ string CloudwatchClient::DescribeAlarms(ClientContext &context, const string &re
 	            "application/x-www-form-urlencoded; charset=utf-8", request_body);
 }
 
+string CloudwatchClient::GetMetricData(ClientContext &context, const string &request_body) const {
+	auto response = Post(context, CloudwatchService::MONITORING, "/", string(),
+	                     "application/x-www-form-urlencoded; charset=utf-8", BuildGetMetricDataQueryBody(request_body));
+	return ConvertGetMetricDataXml(response);
+}
+
 string CloudwatchClient::GetServiceGraph(ClientContext &context, const string &request_body) const {
 	return Post(context, CloudwatchService::XRAY, "/ServiceGraph", string(), "application/json", request_body);
 }
@@ -242,6 +462,8 @@ string CloudwatchClient::Post(ClientContext &context, CloudwatchService service,
 		duckdb_httplib_openssl::Headers headers = {
 		    {"Authorization", signed_headers.authorization},
 		    {"X-Amz-Date", signed_headers.amz_date},
+		    {"Host", signing_request.host},
+		    {"Content-Type", content_type},
 		};
 		if (!target.empty()) {
 			headers.emplace("X-Amz-Target", target);
@@ -249,7 +471,9 @@ string CloudwatchClient::Post(ClientContext &context, CloudwatchService service,
 		if (!signed_headers.security_token.empty()) {
 			headers.emplace("X-Amz-Security-Token", signed_headers.security_token);
 		}
-		auto response = GetConnection(service).Post(path, headers, request_body, content_type);
+		// Keep the transport headers byte-for-byte aligned with the values covered by SigV4. In
+		// particular, cpp-httplib otherwise synthesizes Host and Content-Type after signing.
+		auto response = GetConnection(service).Post(path, headers, request_body, string());
 		if (response && response->status >= 200 && response->status < 300) {
 			return response->body;
 		}

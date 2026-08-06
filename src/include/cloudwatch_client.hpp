@@ -31,6 +31,7 @@ struct CloudwatchClient {
 	string DescribeLogGroups(ClientContext &context, const string &request_body) const;
 	string PutLogEvents(ClientContext &context, const string &request_body) const;
 	string DescribeAlarms(ClientContext &context, const string &request_body) const;
+	string GetMetricData(ClientContext &context, const string &request_body) const;
 	string GetServiceGraph(ClientContext &context, const string &request_body) const;
 	string BaseUrl(CloudwatchService service = CloudwatchService::LOGS) const;
 	string Host(CloudwatchService service = CloudwatchService::LOGS) const;
