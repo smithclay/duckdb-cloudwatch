@@ -197,3 +197,143 @@ statement error
 SELECT * FROM read_cloudwatch_service_dependencies(xray_endpoint => 'https://xray.example.test/path');
 ----
 endpoint must be an origin
+
+# --- Logs Insights -------------------------------------------------------------
+
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'read_cloudwatch_logs_insights';
+----
+true
+
+# Insights argument validation also runs before credential lookup.
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message');
+----
+pass at least one log group
+
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('', log_groups => ['/aws/lambda/example']);
+----
+query string must not be empty
+
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message', log_groups => []::VARCHAR[]);
+----
+pass at least one log group
+
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message', log_groups => ['']);
+----
+log group names must not be empty
+
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message', log_groups => ['/a'], max_rows => 10001);
+----
+max_rows must be between 0 and 10000
+
+# `limit` is accepted as the API's own spelling, but DuckDB's parser requires it quoted.
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message', log_groups => ['/a'], "limit" => -1);
+----
+max_rows must be between 0 and 10000
+
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message', log_groups => ['/a'], max_wait => 0);
+----
+max_wait must be >= 1 second
+
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message', log_groups => ['/a'], poll_interval_ms => 1);
+----
+poll_interval_ms must be >= 10
+
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message', log_groups => ['/a'],
+                                            start_time => 'now', end_time => '-1h');
+----
+end_time must not be before start_time
+
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message', log_groups => ['/a'],
+                                            endpoint => 'http://logs.example.test');
+----
+plaintext HTTP endpoints are allowed only on loopback
+
+# A query over more than 50 log groups is rejected locally rather than by AWS.
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message',
+    log_groups => str_split(rtrim(repeat('/g,', 51), ','), ','));
+----
+at most 50 log groups
+
+statement error
+SELECT * FROM read_cloudwatch_logs_insights('fields @message', log_groups => ['/a']);
+----
+No AWS credentials found
+
+# --- log-group administration --------------------------------------------------
+
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'create_cloudwatch_log_group';
+----
+true
+
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'delete_cloudwatch_log_group';
+----
+true
+
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'create_cloudwatch_log_stream';
+----
+true
+
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'put_cloudwatch_retention_policy';
+----
+true
+
+# Retention values are checked against the set CloudWatch accepts, since AWS's own error does not
+# name the valid values.
+statement error
+SELECT put_cloudwatch_retention_policy('/app/logs', 2);
+----
+retention_days must be one of
+
+statement error
+SELECT create_cloudwatch_log_group('/app/logs', 'missing_secret');
+----
+not found
+
+# --- cloudwatch_serve ----------------------------------------------------------
+
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'cloudwatch_serve';
+----
+true
+
+statement error
+SELECT cloudwatch_serve('http:localhost:10540');
+----
+expected 'cloudwatch:host[:port]'
+
+statement error
+SELECT cloudwatch_serve('cloudwatch:localhost:0');
+----
+Invalid CloudWatch listen port
+
+# Binding anywhere but loopback is opt-in, so a stray serve cannot expose the host by accident.
+statement error
+SELECT cloudwatch_serve('cloudwatch:0.0.0.0:10541');
+----
+Only localhost is allowed
+
+statement error
+SELECT cloudwatch_serve('cloudwatch:localhost:10542', {'unknown_option': true});
+----
+Unsupported cloudwatch_serve option
+
+query I
+SELECT cloudwatch_stop('cloudwatch:localhost:10543');
+----
+not found

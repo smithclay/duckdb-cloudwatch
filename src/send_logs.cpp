@@ -3,6 +3,7 @@
 #include "cloudwatch_client.hpp"
 #include "cloudwatch_json.hpp"
 #include "cloudwatch_secret.hpp"
+#include "logs_table.hpp"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -133,8 +134,16 @@ unique_ptr<FunctionData> CloudwatchSendLogsBind(ClientContext &context, ScalarFu
 	result->log_stream = ConstantStringArgument(context, arguments[2], "log_stream");
 	ValidateDestination(result->log_group, result->log_stream);
 	string secret_name;
-	if (arguments.size() == 4) {
+	if (arguments.size() >= 4) {
 		secret_name = ConstantStringArgument(context, arguments[3], "secret name", true);
+	}
+	if (arguments.size() >= 5) {
+		// A private VPC endpoint, or a local cloudwatch_serve listener. Constant like the
+		// destination itself: the origin must not vary per row.
+		result->client.endpoint = ConstantStringArgument(context, arguments[4], "endpoint", true);
+		CloudwatchLogsSettings settings;
+		settings.endpoint = result->client.endpoint;
+		ValidateCloudwatchLogsSettings(settings, "send_cloudwatch_logs");
 	}
 	result->client.credentials = GetCloudwatchCredentials(context, secret_name, string());
 	bound_function.return_type = LogicalType::VARCHAR;
@@ -256,7 +265,9 @@ void RegisterCloudwatchSendLogsFunction(ExtensionLoader &loader) {
 	ScalarFunctionSet set("send_cloudwatch_logs");
 	for (auto &arguments : vector<vector<LogicalType>> {
 	         {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	         {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
+	         {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	         {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+	          LogicalType::VARCHAR}}) {
 		ScalarFunction function(arguments, LogicalType::VARCHAR, CloudwatchSendLogsFunction, CloudwatchSendLogsBind);
 		function.SetStability(FunctionStability::VOLATILE);
 		function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);

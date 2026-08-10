@@ -95,4 +95,57 @@ string BuildCloudwatchPutEventsRequest(const string &log_group, const string &lo
 //! Parse the HTTP-200 response, including the partial-rejection fields that AWS reports as success.
 CloudwatchPutResponse ParseCloudwatchPutEventsResponse(const string &response);
 
+//! One CloudWatch Logs Insights query. Unlike FilterLogEvents, StartQuery takes epoch *seconds*;
+//! the millisecond bounds here are converted at build time so every SQL surface keeps using the
+//! same millisecond time parsing.
+struct CloudwatchInsightsRequest {
+	vector<string> log_groups;
+	string query_string;
+	int64_t start_time_ms = 0;
+	int64_t end_time_ms = 0;
+	//! 0 omits the field; AWS then defaults to 1000 and caps at 10,000.
+	int64_t limit = 0;
+};
+
+//! Insights returns each row as an ordered list of field/value pairs rather than a fixed schema,
+//! and a row may omit a field another row carries.
+struct CloudwatchInsightsRow {
+	vector<std::pair<string, string>> fields;
+};
+
+enum class CloudwatchInsightsStatus : uint8_t { SCHEDULED, RUNNING, COMPLETE, FAILED, CANCELLED, TIMEOUT, UNKNOWN };
+
+struct CloudwatchInsightsResults {
+	CloudwatchInsightsStatus status = CloudwatchInsightsStatus::UNKNOWN;
+	//! The verbatim AWS status string, kept for error messages on failure states.
+	string status_text;
+	vector<CloudwatchInsightsRow> rows;
+	int64_t records_matched = 0;
+	int64_t records_scanned = 0;
+};
+
+//! True once AWS will not change the result set any further.
+bool IsCloudwatchInsightsTerminal(CloudwatchInsightsStatus status);
+
+//! Build/parse the StartQuery, GetQueryResults, and StopQuery payloads.
+string BuildCloudwatchStartQueryRequest(const CloudwatchInsightsRequest &request);
+string ParseCloudwatchStartQueryResponse(const string &response);
+string BuildCloudwatchQueryIdRequest(const string &query_id);
+CloudwatchInsightsResults ParseCloudwatchGetQueryResultsResponse(const string &response);
+
+//! Log-group administration payloads.
+string BuildCloudwatchCreateLogGroupRequest(const string &log_group);
+string BuildCloudwatchDeleteLogGroupRequest(const string &log_group);
+string BuildCloudwatchCreateLogStreamRequest(const string &log_group, const string &log_stream);
+string BuildCloudwatchPutRetentionPolicyRequest(const string &log_group, int64_t retention_days);
+
+//! The retention values CloudWatch accepts. Anything else is rejected by AWS with an error that
+//! does not name the valid set, so the extension checks it up front.
+bool IsValidCloudwatchRetentionDays(int64_t days);
+string CloudwatchRetentionDaysList();
+
+//! True when an AWS JSON error body carries the given exception code (matched against both the
+//! `__type` field and the message, since the Logs API places it in either depending on operation).
+bool CloudwatchErrorIs(const string &error_body, const char *exception_code);
+
 } // namespace duckdb

@@ -109,7 +109,8 @@ int64_t CheckedSubtract(int64_t value, int64_t amount) {
 	return value - amount;
 }
 
-int64_t ParseRelativeTime(const string &value, int64_t now_ms, const string &parameter_name) {
+int64_t ParseRelativeTime(const string &value, int64_t now_ms, const string &parameter_name,
+                          const string &error_prefix) {
 	auto lower = StringUtil::Lower(value);
 	StringUtil::Trim(lower);
 	if (lower == "now") {
@@ -149,43 +150,9 @@ int64_t ParseRelativeTime(const string &value, int64_t now_ms, const string &par
 	auto magnitude = strtoll(number.c_str(), &end, 10);
 	if (errno == ERANGE || !end || *end != '\0' || magnitude < 0 ||
 	    magnitude > std::numeric_limits<int64_t>::max() / multiplier) {
-		throw InvalidInputException("read_cloudwatch_logs: invalid %s value '%s'", parameter_name, value);
+		throw InvalidInputException("%s: invalid %s value '%s'", error_prefix, parameter_name, value);
 	}
 	return CheckedSubtract(now_ms, magnitude * multiplier);
-}
-
-int64_t ParseCloudwatchTime(const string &value, int64_t now_ms, const string &parameter_name) {
-	auto relative = ParseRelativeTime(value, now_ms, parameter_name);
-	if (relative >= 0) {
-		return relative;
-	}
-
-	errno = 0;
-	char *end = nullptr;
-	auto milliseconds = strtoll(value.c_str(), &end, 10);
-	if (errno != ERANGE && end && end != value.c_str() && *end == '\0' && milliseconds >= 0) {
-		return milliseconds;
-	}
-
-	timestamp_t timestamp;
-	bool has_offset = false;
-	string_t timezone;
-	if (Timestamp::TryConvertTimestampTZ(value.c_str(), value.size(), timestamp, true, has_offset, timezone) ==
-	    TimestampCastResult::SUCCESS) {
-		auto result = Timestamp::GetEpochMs(timestamp);
-		if (result >= 0) {
-			return result;
-		}
-	}
-	if (Timestamp::TryConvertTimestamp(value.c_str(), value.size(), timestamp, false) == TimestampCastResult::SUCCESS) {
-		auto result = Timestamp::GetEpochMs(timestamp);
-		if (result >= 0) {
-			return result;
-		}
-	}
-	throw InvalidInputException("read_cloudwatch_logs: invalid %s value '%s'; use now, -15m/-2h/-7d, epoch "
-	                            "milliseconds, or an ISO-8601 timestamp",
-	                            parameter_name, value);
 }
 
 void ValidateSettings(const CloudwatchLogsBindData &settings) {
@@ -366,8 +333,8 @@ unique_ptr<GlobalTableFunctionState> CloudwatchLogsInitGlobal(ClientContext &, T
 	auto &bind = input.bind_data->Cast<CloudwatchLogsBindData>();
 	state->column_ids = input.column_ids;
 	auto now_ms = Timestamp::GetEpochMs(Timestamp::GetCurrentTimestamp());
-	state->start_time_ms = ParseCloudwatchTime(bind.start_time, now_ms, "start_time");
-	state->end_time_ms = ParseCloudwatchTime(bind.end_time, now_ms, "end_time");
+	state->start_time_ms = ParseCloudwatchTime(bind.start_time, now_ms, "start_time", "read_cloudwatch_logs");
+	state->end_time_ms = ParseCloudwatchTime(bind.end_time, now_ms, "end_time", "read_cloudwatch_logs");
 	if (state->start_time_ms > state->end_time_ms) {
 		throw InvalidInputException("read_cloudwatch_logs: start_time must be <= end_time");
 	}
@@ -412,6 +379,41 @@ InsertionOrderPreservingMap<string> CloudwatchLogsToString(TableFunctionToString
 }
 
 } // namespace
+
+int64_t ParseCloudwatchTime(const string &value, int64_t now_ms, const string &parameter_name,
+                            const string &error_prefix) {
+	auto relative = ParseRelativeTime(value, now_ms, parameter_name, error_prefix);
+	if (relative >= 0) {
+		return relative;
+	}
+
+	errno = 0;
+	char *end = nullptr;
+	auto milliseconds = strtoll(value.c_str(), &end, 10);
+	if (errno != ERANGE && end && end != value.c_str() && *end == '\0' && milliseconds >= 0) {
+		return milliseconds;
+	}
+
+	timestamp_t timestamp;
+	bool has_offset = false;
+	string_t timezone;
+	if (Timestamp::TryConvertTimestampTZ(value.c_str(), value.size(), timestamp, true, has_offset, timezone) ==
+	    TimestampCastResult::SUCCESS) {
+		auto result = Timestamp::GetEpochMs(timestamp);
+		if (result >= 0) {
+			return result;
+		}
+	}
+	if (Timestamp::TryConvertTimestamp(value.c_str(), value.size(), timestamp, false) == TimestampCastResult::SUCCESS) {
+		auto result = Timestamp::GetEpochMs(timestamp);
+		if (result >= 0) {
+			return result;
+		}
+	}
+	throw InvalidInputException("%s: invalid %s value '%s'; use now, -15m/-2h/-7d, epoch "
+	                            "milliseconds, or an ISO-8601 timestamp",
+	                            error_prefix, parameter_name, value);
+}
 
 void GetCloudwatchLogsSchema(vector<LogicalType> &types, vector<string> &names) {
 	names = {"time_unix_nano",
