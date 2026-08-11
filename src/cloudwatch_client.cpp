@@ -70,8 +70,7 @@ void AppendQueryValue(vector<string> &parts, yyjson_val *value, const string &pr
 	}
 	if (yyjson_is_arr(value)) {
 		for (size_t index = 0; index < yyjson_arr_size(value); index++) {
-			AppendQueryValue(parts, yyjson_arr_get(value, index),
-			                 prefix + ".member." + std::to_string(index + 1));
+			AppendQueryValue(parts, yyjson_arr_get(value, index), prefix + ".member." + std::to_string(index + 1));
 		}
 		return;
 	}
@@ -423,13 +422,13 @@ string CloudwatchClient::DeleteLogGroup(ClientContext &context, const string &re
 
 string CloudwatchClient::PutRetentionPolicy(ClientContext &context, const string &request_body) const {
 	std::lock_guard<std::mutex> write_guard(write_mutex);
-	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.PutRetentionPolicy",
-	            "application/x-amz-json-1.1", request_body);
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.PutRetentionPolicy", "application/x-amz-json-1.1",
+	            request_body);
 }
 
 string CloudwatchClient::DescribeLogStreams(ClientContext &context, const string &request_body) const {
-	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.DescribeLogStreams",
-	            "application/x-amz-json-1.1", request_body);
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.DescribeLogStreams", "application/x-amz-json-1.1",
+	            request_body);
 }
 
 bool CloudwatchClient::TryPostLogs(ClientContext &context, const string &target, const string &request_body,

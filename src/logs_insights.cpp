@@ -92,7 +92,8 @@ vector<string> StringListValue(const Value &value, const string &parameter_name)
 CloudwatchInsightsResults RunInsightsQuery(ClientContext &context, const CloudwatchClient &client,
                                            const CloudwatchInsightsRequest &request, int64_t poll_interval_ms,
                                            int64_t max_wait_ms) {
-	auto query_id = ParseCloudwatchStartQueryResponse(client.StartQuery(context, BuildCloudwatchStartQueryRequest(request)));
+	auto query_id =
+	    ParseCloudwatchStartQueryResponse(client.StartQuery(context, BuildCloudwatchStartQueryRequest(request)));
 	const auto deadline = NowMs() + max_wait_ms;
 	for (;;) {
 		CloudwatchInsightsResults results;
@@ -275,7 +276,7 @@ unique_ptr<FunctionData> CloudwatchInsightsBind(ClientContext &context, TableFun
 }
 
 unique_ptr<GlobalTableFunctionState> CloudwatchInsightsInitGlobal(ClientContext &context,
-                                                                 TableFunctionInitInput &input) {
+                                                                  TableFunctionInitInput &input) {
 	auto state = make_uniq<CloudwatchInsightsGlobalState>();
 	state->column_ids = input.column_ids;
 	return std::move(state);

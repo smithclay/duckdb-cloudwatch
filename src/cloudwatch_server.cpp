@@ -320,18 +320,18 @@ public:
 		// and DuckDB's bundled copy is not. The CloudWatch Agent gzips every batch that compresses,
 		// so the header is moved aside here -- pre-routing runs before the body is read, so the
 		// bytes then arrive raw -- and the handler inflates them itself.
-		server->set_pre_routing_handler([](const duckdb_httplib_openssl::Request &request,
-		                                   duckdb_httplib_openssl::Response &) {
-			auto encoding = request.get_header_value("Content-Encoding");
-			if (!encoding.empty()) {
-				// cpp-httplib hands pre-routing a const request but mutates it itself moments
-				// later; this only relabels one header, before anything has read the body.
-				auto &mutable_request = const_cast<duckdb_httplib_openssl::Request &>(request);
-				mutable_request.headers.erase("Content-Encoding");
-				mutable_request.set_header(STASHED_ENCODING_HEADER, encoding);
-			}
-			return duckdb_httplib_openssl::Server::HandlerResponse::Unhandled;
-		});
+		server->set_pre_routing_handler(
+		    [](const duckdb_httplib_openssl::Request &request, duckdb_httplib_openssl::Response &) {
+			    auto encoding = request.get_header_value("Content-Encoding");
+			    if (!encoding.empty()) {
+				    // cpp-httplib hands pre-routing a const request but mutates it itself moments
+				    // later; this only relabels one header, before anything has read the body.
+				    auto &mutable_request = const_cast<duckdb_httplib_openssl::Request &>(request);
+				    mutable_request.headers.erase("Content-Encoding");
+				    mutable_request.set_header(STASHED_ENCODING_HEADER, encoding);
+			    }
+			    return duckdb_httplib_openssl::Server::HandlerResponse::Unhandled;
+		    });
 		server->Get("/healthz",
 		            [](const duckdb_httplib_openssl::Request &, duckdb_httplib_openssl::Response &response) {
 			            SetJson(response, 200, "{\"status\":\"ok\"}");
@@ -427,10 +427,10 @@ private:
 			SetJson(response, 200, result);
 		} catch (AwsError &error) {
 			SetJson(response, 400,
-			        "{\"__type\":\"" + JsonEscape(error.code) + "\",\"message\":\"" + JsonEscape(error.message) + "\"}");
+			        "{\"__type\":\"" + JsonEscape(error.code) + "\",\"message\":\"" + JsonEscape(error.message) +
+			            "\"}");
 		} catch (std::exception &ex) {
-			SetJson(response, 500,
-			        "{\"__type\":\"InternalFailure\",\"message\":\"" + JsonEscape(ex.what()) + "\"}");
+			SetJson(response, 500, "{\"__type\":\"InternalFailure\",\"message\":\"" + JsonEscape(ex.what()) + "\"}");
 		}
 	}
 
@@ -489,14 +489,15 @@ private:
 	}
 
 	bool GroupExists(const string &log_group) {
-		auto result = RunQuery("SELECT count(*) FROM " + QualifiedGroups() + " WHERE log_group = " +
-		                       SqlLiteral(log_group) + " AND log_stream IS NULL");
+		auto result = RunQuery("SELECT count(*) FROM " + QualifiedGroups() +
+		                       " WHERE log_group = " + SqlLiteral(log_group) + " AND log_stream IS NULL");
 		return result->GetValue(0, 0).GetValue<int64_t>() > 0;
 	}
 
 	bool StreamExists(const string &log_group, const string &log_stream) {
-		auto result = RunQuery("SELECT count(*) FROM " + QualifiedGroups() + " WHERE log_group = " +
-		                       SqlLiteral(log_group) + " AND log_stream = " + SqlLiteral(log_stream));
+		auto result =
+		    RunQuery("SELECT count(*) FROM " + QualifiedGroups() + " WHERE log_group = " + SqlLiteral(log_group) +
+		             " AND log_stream = " + SqlLiteral(log_stream));
 		return result->GetValue(0, 0).GetValue<int64_t>() > 0;
 	}
 
@@ -622,8 +623,8 @@ private:
 
 	string DescribeLogGroups(yyjson_val *root) {
 		auto prefix = GetStringOr(root, "logGroupNamePrefix");
-		string sql = "SELECT log_group, retention_in_days, created_ms FROM " + QualifiedGroups() +
-		             " WHERE log_stream IS NULL";
+		string sql =
+		    "SELECT log_group, retention_in_days, created_ms FROM " + QualifiedGroups() + " WHERE log_stream IS NULL";
 		if (!prefix.empty()) {
 			sql += " AND starts_with(log_group, " + SqlLiteral(prefix) + ")";
 		}
@@ -664,9 +665,10 @@ private:
 		// calls DescribeLogStreams to decide whether it still needs to create a stream.
 		string sql = "SELECT name, min(first_ms), max(last_ms) FROM ("
 		             "SELECT log_stream AS name, NULL::BIGINT AS first_ms, NULL::BIGINT AS last_ms FROM " +
-		             QualifiedGroups() + " WHERE log_group = " + SqlLiteral(log_group) + " AND log_stream IS NOT NULL "
-		             "UNION ALL SELECT log_stream, min(timestamp_ms), max(timestamp_ms) FROM " + QualifiedEvents() +
-		             " WHERE log_group = " + SqlLiteral(log_group) + " GROUP BY log_stream) ";
+		             QualifiedGroups() + " WHERE log_group = " + SqlLiteral(log_group) +
+		             " AND log_stream IS NOT NULL "
+		             "UNION ALL SELECT log_stream, min(timestamp_ms), max(timestamp_ms) FROM " +
+		             QualifiedEvents() + " WHERE log_group = " + SqlLiteral(log_group) + " GROUP BY log_stream) ";
 		sql += prefix.empty() ? "WHERE TRUE" : "WHERE starts_with(name, " + SqlLiteral(prefix) + ")";
 		sql += " GROUP BY name ORDER BY name";
 
@@ -956,9 +958,9 @@ CloudwatchServerConfig ParseOptions(const Value &options) {
 	ReadOption(options, "auto_create_groups", config.auto_create_groups);
 	ReadOption(options, "max_body_bytes", config.max_body_bytes);
 	ReadOption(options, "http_threads", config.http_threads);
-	static const std::unordered_set<string> valid = {"schema_name",        "table_name",         "groups_table_name",
-	                                                 "allow_other_hostname", "create_table",     "auto_create_groups",
-	                                                 "max_body_bytes",     "http_threads"};
+	static const std::unordered_set<string> valid = {"schema_name",          "table_name",   "groups_table_name",
+	                                                 "allow_other_hostname", "create_table", "auto_create_groups",
+	                                                 "max_body_bytes",       "http_threads"};
 	for (idx_t index = 0; index < StructType::GetChildCount(options.type()); index++) {
 		auto name = StructType::GetChildName(options.type(), index);
 		if (valid.find(StringUtil::Lower(name)) == valid.end()) {

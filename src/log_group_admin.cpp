@@ -36,8 +36,7 @@ struct CloudwatchAdminBindData : public FunctionData {
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<CloudwatchAdminBindData>();
 		return client.credentials.secret_name == other.client.credentials.secret_name &&
-		       client.credentials.region == other.client.credentials.region &&
-		       client.endpoint == other.client.endpoint;
+		       client.credentials.region == other.client.credentials.region && client.endpoint == other.client.endpoint;
 	}
 };
 
@@ -152,10 +151,9 @@ void CreateLogGroupFunction(DataChunk &args, ExpressionState &state, Vector &res
 		}
 		auto log_group = group.GetString();
 		ValidateLogGroupName(log_group, "create_cloudwatch_log_group");
-		return StringVector::AddString(
-		    result, RunAdminCall(context, bind.client, "Logs_20140328.CreateLogGroup",
-		                         BuildCloudwatchCreateLogGroupRequest(log_group), "ResourceAlreadyExistsException",
-		                         "exists", "created"));
+		return StringVector::AddString(result, RunAdminCall(context, bind.client, "Logs_20140328.CreateLogGroup",
+		                                                    BuildCloudwatchCreateLogGroupRequest(log_group),
+		                                                    "ResourceAlreadyExistsException", "exists", "created"));
 	});
 }
 
@@ -170,10 +168,9 @@ void DeleteLogGroupFunction(DataChunk &args, ExpressionState &state, Vector &res
 		}
 		auto log_group = group.GetString();
 		ValidateLogGroupName(log_group, "delete_cloudwatch_log_group");
-		return StringVector::AddString(
-		    result, RunAdminCall(context, bind.client, "Logs_20140328.DeleteLogGroup",
-		                         BuildCloudwatchDeleteLogGroupRequest(log_group), "ResourceNotFoundException", "absent",
-		                         "deleted"));
+		return StringVector::AddString(result, RunAdminCall(context, bind.client, "Logs_20140328.DeleteLogGroup",
+		                                                    BuildCloudwatchDeleteLogGroupRequest(log_group),
+		                                                    "ResourceNotFoundException", "absent", "deleted"));
 	});
 }
 
@@ -191,10 +188,10 @@ void CreateLogStreamFunction(DataChunk &args, ExpressionState &state, Vector &re
 		    auto log_stream = stream.GetString();
 		    ValidateLogGroupName(log_group, "create_cloudwatch_log_stream");
 		    ValidateLogStreamName(log_stream, "create_cloudwatch_log_stream");
-		    return StringVector::AddString(
-		        result, RunAdminCall(context, bind.client, "Logs_20140328.CreateLogStream",
-		                             BuildCloudwatchCreateLogStreamRequest(log_group, log_stream),
-		                             "ResourceAlreadyExistsException", "exists", "created"));
+		    return StringVector::AddString(result,
+		                                   RunAdminCall(context, bind.client, "Logs_20140328.CreateLogStream",
+		                                                BuildCloudwatchCreateLogStreamRequest(log_group, log_stream),
+		                                                "ResourceAlreadyExistsException", "exists", "created"));
 	    });
 }
 
@@ -215,9 +212,10 @@ void PutRetentionPolicyFunction(DataChunk &args, ExpressionState &state, Vector 
 			        "put_cloudwatch_retention_policy: retention_days must be one of %s (got %lld)",
 			        CloudwatchRetentionDaysList(), static_cast<long long>(days));
 		    }
-		    return StringVector::AddString(
-		        result, RunAdminCall(context, bind.client, "Logs_20140328.PutRetentionPolicy",
-		                             BuildCloudwatchPutRetentionPolicyRequest(log_group, days), nullptr, nullptr, "ok"));
+		    return StringVector::AddString(result,
+		                                   RunAdminCall(context, bind.client, "Logs_20140328.PutRetentionPolicy",
+		                                                BuildCloudwatchPutRetentionPolicyRequest(log_group, days),
+		                                                nullptr, nullptr, "ok"));
 	    });
 }
 
@@ -228,10 +226,10 @@ void RegisterCloudwatchLogGroupAdminFunctions(ExtensionLoader &loader) {
 	// endpoint override (a private VPC endpoint, or a local cloudwatch_serve listener).
 	{
 		ScalarFunctionSet set("create_cloudwatch_log_group");
-		for (auto &arguments : vector<vector<LogicalType>> {
-		         {LogicalType::VARCHAR},
-		         {LogicalType::VARCHAR, LogicalType::VARCHAR},
-		         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
+		for (auto &arguments :
+		     vector<vector<LogicalType>> {{LogicalType::VARCHAR},
+		                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
+		                                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
 			ScalarFunction function(arguments, LogicalType::VARCHAR, CreateLogGroupFunction, AdminBind<1>);
 			function.SetStability(FunctionStability::VOLATILE);
 			set.AddFunction(function);
@@ -240,10 +238,10 @@ void RegisterCloudwatchLogGroupAdminFunctions(ExtensionLoader &loader) {
 	}
 	{
 		ScalarFunctionSet set("delete_cloudwatch_log_group");
-		for (auto &arguments : vector<vector<LogicalType>> {
-		         {LogicalType::VARCHAR},
-		         {LogicalType::VARCHAR, LogicalType::VARCHAR},
-		         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
+		for (auto &arguments :
+		     vector<vector<LogicalType>> {{LogicalType::VARCHAR},
+		                                  {LogicalType::VARCHAR, LogicalType::VARCHAR},
+		                                  {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}}) {
 			ScalarFunction function(arguments, LogicalType::VARCHAR, DeleteLogGroupFunction, AdminBind<1>);
 			function.SetStability(FunctionStability::VOLATILE);
 			set.AddFunction(function);
