@@ -181,6 +181,49 @@ silently duplicating logs. AWS can partially accept a request while returning HT
 `'ok'`. Earlier batches may already be stored if a later batch fails. Sending requires
 `logs:PutLogEvents` on the destination stream.
 
+## `send_cloudwatch_metrics`
+
+`send_cloudwatch_metrics` writes an OTLP-shaped gauge table to CloudWatch Metrics through
+[`PutMetricData`](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_PutMetricData.html).
+Pass a whole row and a constant namespace; each accepted row returns `'ok'`:
+
+```sql
+SELECT send_cloudwatch_metrics(m, '/obsbench/run1') FROM my_metrics m;
+
+-- Optional third/fourth arguments: a named aws/s3 secret and an endpoint override.
+SELECT send_cloudwatch_metrics(m, '/obsbench/run1', 'cw_prod', 'http://localhost:10519') FROM my_metrics m;
+```
+
+The column mapping mirrors the 17-column gauge shape `read_cloudwatch_metrics` returns, so a table
+sent through here reads back with the shape it went out with:
+
+| Struct column (first match wins) | `PutMetricData` field |
+|---|---|
+| `name` / `metric_name` | `MetricName` (required, non-empty) |
+| `double_value` / `value` | `Value` (required; a NULL reading is skipped, not sent as zero) |
+| `time_unix_nano` / `timestamp` | `Timestamp` (defaults to now) |
+| `unit` | `Unit`, translated (see below) |
+| `service_name` | a `service.name` dimension |
+| `metric_attributes` / `attributes` | further dimensions, from a JSON object of strings |
+
+Three CloudWatch constraints shape the mapping:
+
+- **Units are a closed vocabulary.** CloudWatch rejects anything outside its own enum, so OTLP units
+  are translated: `s`/`ms`/`us` become `Seconds`/`Milliseconds`/`Microseconds`, `By` becomes `Bytes`,
+  `%` becomes `Percent`, and UCUM annotation units such as `{request}` become `Count`. Anything with
+  no CloudWatch equivalent — **nanoseconds most importantly, which CloudWatch cannot express** —
+  becomes `None`, leaving the value unscaled rather than mislabelled as a unit it is not.
+- **Timestamps are whole seconds** in the query protocol, and CloudWatch rejects points older than
+  two weeks or more than two hours in the future.
+- **A datum is billed as a custom metric per unique namespace + name + dimension combination**, and
+  custom metrics cannot be deleted — they age out after 15 months. Billing is prorated hourly, so a
+  short run costs cents, but dimension cardinality is a permanent footprint, not a temporary one.
+
+Writes are non-idempotent and `PutMetricData` carries no request id, so a retry after an unseen
+response would double-count. Only responses proving the call was rejected before doing any work are
+retried. Batches are capped at 1000 datums and held under the 1 MB body limit; earlier batches may
+already be stored if a later one fails. Sending requires `cloudwatch:PutMetricData`.
+
 ## `read_cloudwatch_logs_insights`
 
 `FilterLogEvents` can only return whole events, so any aggregation happens after every matching row
@@ -276,12 +319,27 @@ ingestion_time_ms, event_id, message)` — CloudWatch's own shape rather than OT
 `PutLogEvents` carries nothing else. Read them back through `read_cloudwatch_logs(...,
 endpoint => 'http://localhost:10519')` to get the 18-column mapping.
 
+Metrics land in `cloudwatch_metric_data` as `(namespace, metric_name, timestamp_ms, value, unit,
+dimensions)`, one row per datum with no rollup. `dimensions` is a `MAP(VARCHAR, VARCHAR)` rather
+than a JSON string, so both the listener's own filtering and your queries work in core DuckDB
+without the json extension loaded:
+
+```sql
+SELECT metric_name, value, dimensions['service.name'] FROM cloudwatch_metric_data;
+```
+
 Options (second argument, a `STRUCT`): `schema_name`, `table_name`, `groups_table_name`,
-`create_table`, `allow_other_hostname`, `auto_create_groups`, `max_body_bytes`, `http_threads`.
+`metrics_table_name`, `create_table`, `allow_other_hostname`, `auto_create_groups`,
+`max_body_bytes`, `http_threads`.
 
 Implemented operations are `CreateLogGroup`, `CreateLogStream`, `DeleteLogGroup`,
 `PutRetentionPolicy`, `DescribeLogGroups`, `DescribeLogStreams`, and `PutLogEvents` — the set the
-CloudWatch Agent uses — plus `FilterLogEvents` for reading back. Behaviour is faithful where it
+CloudWatch Agent uses — plus `FilterLogEvents` for reading back. Metrics are served on the same
+port but over the AWS *query* protocol (form-encoded in, XML out) rather than the Logs JSON API,
+distinguished by the absence of an `X-Amz-Target` header: `PutMetricData` and `GetMetricData` are
+both implemented, the latter restricted to plain aggregation over a period with the `Sum`,
+`Average`, `Maximum`, `Minimum`, and `SampleCount` statistics — no metric-math expressions, no
+percentile statistics, no pagination. Behaviour is faithful where it
 matters: `PutLogEvents` to an unknown group fails with `ResourceNotFoundException` rather than
 creating one implicitly (set `auto_create_groups` to change that), so the agent's real
 create-then-send sequence is exercised.

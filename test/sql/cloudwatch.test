@@ -337,3 +337,39 @@ query I
 SELECT cloudwatch_stop('cloudwatch:localhost:10543');
 ----
 not found
+
+# --- send_cloudwatch_metrics ---------------------------------------------------
+
+query I
+SELECT count(*) >= 1 FROM duckdb_functions() WHERE function_name = 'send_cloudwatch_metrics';
+----
+true
+
+statement error
+DESCRIBE SELECT send_cloudwatch_metrics('not a struct', '/obsbench/run1');
+----
+must be a STRUCT
+
+# The value column is what makes a gauge a gauge; a struct without one is a bind error, not an
+# empty send.
+statement error
+DESCRIBE SELECT send_cloudwatch_metrics({'name': 'cpu'}, '/obsbench/run1');
+----
+needs a 'double_value' or 'value' column
+
+statement error
+DESCRIBE SELECT send_cloudwatch_metrics({'name': 'cpu', 'double_value': 1.0}, 'AWS/EC2');
+----
+reserved for AWS services
+
+statement error
+DESCRIBE SELECT send_cloudwatch_metrics({'name': 'cpu', 'double_value': 1.0}, '');
+----
+must not be empty
+
+# The namespace must be a constant: a destination that varied per row could not be batched, and
+# would turn row data into an AWS resource name.
+statement error
+DESCRIBE SELECT send_cloudwatch_metrics(m, m.name) FROM (SELECT {'name': 'cpu', 'double_value': 1.0} AS m) t;
+----
+must be a constant string
