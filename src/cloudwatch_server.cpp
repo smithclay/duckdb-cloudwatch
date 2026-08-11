@@ -12,6 +12,11 @@
 #include "duckdb/storage/storage_extension.hpp"
 
 #ifndef __EMSCRIPTEN__
+// cpp-httplib caps form-urlencoded bodies at 8 KB by default, separately from
+// set_payload_max_length. The metrics query protocol is form-encoded and a single
+// PutMetricData batch runs to hundreds of KB, so that default would 413 every real
+// batch. The configured max_body_bytes remains the limit that actually applies.
+#define CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH (64ULL * 1024ULL * 1024ULL)
 #include "httplib.hpp"
 #endif
 #include "yyjson.hpp"
@@ -19,8 +24,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <ctime>
+#include <iomanip>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <unordered_set>
 
@@ -170,6 +180,7 @@ struct CloudwatchServerConfig {
 	string schema_name = "main";
 	string table_name = "cloudwatch_logs";
 	string groups_table_name = "cloudwatch_log_groups";
+	string metrics_table_name = "cloudwatch_metric_data";
 	bool allow_other_hostname = false;
 	bool create_table = true;
 	//! AWS rejects PutLogEvents to a group that does not exist. Keeping that behaviour by default
@@ -260,6 +271,97 @@ string FilterPatternSubstring(const string &pattern) {
 void SetJson(duckdb_httplib_openssl::Response &response, int status, const string &body) {
 	response.status = status;
 	response.set_content(body, "application/x-amz-json-1.1");
+}
+
+//! The monitoring API (metrics) speaks the AWS query protocol -- form-encoded in, XML out --
+//! rather than the Logs JSON API, so it needs its own encoding helpers.
+void SetXml(duckdb_httplib_openssl::Response &response, int status, const string &body) {
+	response.status = status;
+	response.set_content(body, "text/xml");
+}
+
+string XmlEscape(const string &input) {
+	string output;
+	for (auto c : input) {
+		switch (c) {
+		case '&':
+			output += "&amp;";
+			break;
+		case '<':
+			output += "&lt;";
+			break;
+		case '>':
+			output += "&gt;";
+			break;
+		case '"':
+			output += "&quot;";
+			break;
+		default:
+			output += c;
+		}
+	}
+	return output;
+}
+
+string FormDecode(const string &input) {
+	string output;
+	for (idx_t index = 0; index < input.size(); index++) {
+		if (input[index] == '+') {
+			output += ' ';
+		} else if (input[index] == '%' && index + 2 < input.size()) {
+			auto hex = input.substr(index + 1, 2);
+			output += static_cast<char>(std::strtol(hex.c_str(), nullptr, 16));
+			index += 2;
+		} else {
+			output += input[index];
+		}
+	}
+	return output;
+}
+
+//! Query-protocol bodies are flat: `MetricData.member.1.Value=3`. Callers reassemble the shape
+//! they need by looking up dotted keys, which is simpler than rebuilding a tree.
+std::map<string, string> ParseFormBody(const string &body) {
+	std::map<string, string> fields;
+	idx_t start = 0;
+	while (start <= body.size()) {
+		auto end = body.find('&', start);
+		if (end == string::npos) {
+			end = body.size();
+		}
+		auto pair = body.substr(start, end - start);
+		auto equals = pair.find('=');
+		if (equals != string::npos) {
+			fields[FormDecode(pair.substr(0, equals))] = FormDecode(pair.substr(equals + 1));
+		}
+		start = end + 1;
+	}
+	return fields;
+}
+
+//! Query-protocol timestamps are ISO8601 (`2026-08-05T13:01:00Z`).
+int64_t ParseIsoMs(const string &text) {
+	timestamp_t stamp;
+	bool has_offset = false;
+	string_t zone;
+	if (Timestamp::TryConvertTimestampTZ(text.c_str(), text.size(), stamp, true, has_offset, zone) !=
+	    TimestampCastResult::SUCCESS) {
+		throw AwsError("InvalidParameterValue", "Could not parse timestamp '" + text + "'");
+	}
+	return Timestamp::GetEpochMs(stamp);
+}
+
+string FormatIso(int64_t epoch_ms) {
+	auto seconds = std::time_t(epoch_ms / 1000);
+	std::tm utc {};
+#ifdef _WIN32
+	gmtime_s(&utc, &seconds);
+#else
+	gmtime_r(&seconds, &utc);
+#endif
+	char buffer[32];
+	std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utc);
+	return string(buffer);
 }
 
 string JsonEscape(const string &input) {
@@ -380,6 +482,12 @@ public:
 
 private:
 	void Handle(const duckdb_httplib_openssl::Request &request, duckdb_httplib_openssl::Response &response) {
+		// Metrics arrive on the same port but speak a different protocol: form-encoded with the
+		// operation in an `Action` field, rather than JSON with an X-Amz-Target header.
+		if (request.get_header_value("X-Amz-Target").empty()) {
+			HandleQuery(request, response);
+			return;
+		}
 		try {
 			auto target = request.get_header_value("X-Amz-Target");
 			if (!StringUtil::StartsWith(target, TARGET_PREFIX)) {
@@ -434,6 +542,171 @@ private:
 		}
 	}
 
+	void HandleQuery(const duckdb_httplib_openssl::Request &request, duckdb_httplib_openssl::Response &response) {
+		try {
+			auto fields = ParseFormBody(request.body);
+			auto action = fields.count("Action") ? fields.at("Action") : string();
+			string result;
+			if (action == "PutMetricData") {
+				result = PutMetricData(fields);
+			} else if (action == "GetMetricData") {
+				result = GetMetricData(fields);
+			} else {
+				// Deliberately narrow, for the same reason Logs Insights is absent: this is a sink
+				// and a test double, not a reimplementation of CloudWatch's aggregation surface.
+				throw AwsError("InvalidAction", "cloudwatch_serve does not implement " + action);
+			}
+			SetXml(response, 200, result);
+		} catch (AwsError &error) {
+			SetXml(response, 400,
+			       "<ErrorResponse><Error><Type>Sender</Type><Code>" + XmlEscape(error.code) + "</Code><Message>" +
+			           XmlEscape(error.message) + "</Message></Error></ErrorResponse>");
+		} catch (std::exception &ex) {
+			SetXml(response, 500,
+			       "<ErrorResponse><Error><Type>Receiver</Type><Code>InternalFailure</Code><Message>" +
+			           XmlEscape(ex.what()) + "</Message></Error></ErrorResponse>");
+		}
+	}
+
+	string PutMetricData(const std::map<string, string> &fields) {
+		auto name_space = fields.count("Namespace") ? fields.at("Namespace") : string();
+		if (name_space.empty()) {
+			throw AwsError("MissingParameter", "Namespace is required");
+		}
+		vector<vector<Value>> rows;
+		for (idx_t index = 1;; index++) {
+			auto prefix = "MetricData.member." + std::to_string(index);
+			auto name = fields.find(prefix + ".MetricName");
+			if (name == fields.end()) {
+				break;
+			}
+			auto value = fields.find(prefix + ".Value");
+			if (value == fields.end()) {
+				throw AwsError("MissingParameter", prefix + ".Value is required");
+			}
+			auto timestamp = fields.find(prefix + ".Timestamp");
+			auto unit = fields.find(prefix + ".Unit");
+
+			vector<Value> dim_keys, dim_values;
+			for (idx_t d = 1;; d++) {
+				auto dim = prefix + ".Dimensions.member." + std::to_string(d);
+				auto dim_name = fields.find(dim + ".Name");
+				auto dim_value = fields.find(dim + ".Value");
+				if (dim_name == fields.end() || dim_value == fields.end()) {
+					break;
+				}
+				dim_keys.push_back(Value(dim_name->second));
+				dim_values.push_back(Value(dim_value->second));
+			}
+
+			rows.push_back({Value(name_space), Value(name->second),
+			                Value::BIGINT(timestamp == fields.end() ? NowMs() : ParseIsoMs(timestamp->second)),
+			                Value::DOUBLE(std::strtod(value->second.c_str(), nullptr)),
+			                unit == fields.end() ? Value(string("None")) : Value(unit->second),
+			                Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, dim_keys, dim_values)});
+		}
+		if (rows.empty()) {
+			throw AwsError("MissingParameter", "MetricData must contain at least one datum");
+		}
+		{
+			std::lock_guard<std::mutex> lock(writer_mutex);
+			Appender appender(*writer, config.schema_name, config.metrics_table_name);
+			for (const auto &row : rows) {
+				appender.BeginRow();
+				for (const auto &field : row) {
+					appender.Append(field);
+				}
+				appender.EndRow();
+			}
+			appender.Close();
+		}
+		total_requests++;
+		total_rows += rows.size();
+		return "<PutMetricDataResponse><ResponseMetadata><RequestId>cloudwatch-serve</RequestId>"
+		       "</ResponseMetadata></PutMetricDataResponse>";
+	}
+
+	//! Aggregation only -- no metric-math expressions, no percentile statistics, no pagination.
+	//! That covers what read_cloudwatch_metrics asks for and nothing else.
+	string GetMetricData(const std::map<string, string> &fields) {
+		const string prefix = "MetricDataQueries.member.1";
+		auto get = [&](const string &key) {
+			auto found = fields.find(key);
+			return found == fields.end() ? string() : found->second;
+		};
+		auto name_space = get(prefix + ".MetricStat.Metric.Namespace");
+		auto metric_name = get(prefix + ".MetricStat.Metric.MetricName");
+		auto stat = get(prefix + ".MetricStat.Stat");
+		auto period_text = get(prefix + ".MetricStat.Period");
+		if (metric_name.empty()) {
+			throw AwsError("MissingParameter", "MetricStat.Metric.MetricName is required");
+		}
+		int64_t period = period_text.empty() ? 60 : std::strtoll(period_text.c_str(), nullptr, 10);
+		if (period <= 0) {
+			throw AwsError("InvalidParameterValue", "Period must be positive");
+		}
+		auto start_ms = ParseIsoMs(get("StartTime"));
+		auto end_ms = ParseIsoMs(get("EndTime"));
+
+		string aggregate;
+		if (stat == "Sum") {
+			aggregate = "sum(value)";
+		} else if (stat.empty() || stat == "Average") {
+			aggregate = "avg(value)";
+		} else if (stat == "Maximum") {
+			aggregate = "max(value)";
+		} else if (stat == "Minimum") {
+			aggregate = "min(value)";
+		} else if (stat == "SampleCount") {
+			aggregate = "count(value)::DOUBLE";
+		} else {
+			throw AwsError("InvalidParameterValue",
+			               "cloudwatch_serve supports Sum, Average, Maximum, Minimum and SampleCount, not " + stat);
+		}
+
+		string where = "metric_name = " + SqlLiteral(metric_name);
+		if (!name_space.empty()) {
+			where += " AND namespace = " + SqlLiteral(name_space);
+		}
+		// GetMetricData is start-exclusive and end-inclusive.
+		where += " AND timestamp_ms > " + std::to_string(start_ms);
+		where += " AND timestamp_ms <= " + std::to_string(end_ms);
+		for (idx_t d = 1;; d++) {
+			auto dim = prefix + ".MetricStat.Metric.Dimensions.member." + std::to_string(d);
+			auto dim_name = get(dim + ".Name");
+			auto dim_value = get(dim + ".Value");
+			if (dim_name.empty() || dim_value.empty()) {
+				break;
+			}
+			// Map lookup rather than a JSON path: dimension names routinely contain dots
+			// (`service.name`), and this keeps the listener free of the json extension.
+			where += " AND list_extract(map_extract(dimensions, " + SqlLiteral(dim_name) +
+			         "), 1) = " + SqlLiteral(dim_value);
+		}
+
+		auto period_ms = std::to_string(period * 1000);
+		auto sql = "SELECT (timestamp_ms // " + period_ms + ") * " + period_ms + " AS bucket, " + aggregate +
+		           " AS agg FROM " + QualifiedMetrics() + " WHERE " + where + " GROUP BY bucket ORDER BY bucket";
+		string timestamps, values;
+		{
+			std::lock_guard<std::mutex> lock(writer_mutex);
+			auto result = RunQuery(sql);
+			for (idx_t row = 0; row < result->RowCount(); row++) {
+				timestamps += "<member>" + FormatIso(result->GetValue(0, row).GetValue<int64_t>()) + "</member>";
+				std::ostringstream number;
+				number << std::setprecision(17) << result->GetValue(1, row).GetValue<double>();
+				values += "<member>" + number.str() + "</member>";
+			}
+		}
+		return "<GetMetricDataResponse><GetMetricDataResult><MetricDataResults><member>"
+		       "<Id>m1</Id><Label>" +
+		       XmlEscape(metric_name) +
+		       "</Label><StatusCode>Complete</StatusCode>"
+		       "<Timestamps>" +
+		       timestamps + "</Timestamps><Values>" + values +
+		       "</Values></member></MetricDataResults></GetMetricDataResult></GetMetricDataResponse>";
+	}
+
 	string QualifiedEvents() const {
 		return KeywordHelper::WriteOptionallyQuoted(config.schema_name) + "." +
 		       KeywordHelper::WriteOptionallyQuoted(config.table_name);
@@ -441,6 +714,10 @@ private:
 	string QualifiedGroups() const {
 		return KeywordHelper::WriteOptionallyQuoted(config.schema_name) + "." +
 		       KeywordHelper::WriteOptionallyQuoted(config.groups_table_name);
+	}
+	string QualifiedMetrics() const {
+		return KeywordHelper::WriteOptionallyQuoted(config.schema_name) + "." +
+		       KeywordHelper::WriteOptionallyQuoted(config.metrics_table_name);
 	}
 
 	void EnsureTargetTables() {
@@ -455,6 +732,13 @@ private:
 			RunOrThrow("CREATE TABLE IF NOT EXISTS " + QualifiedGroups() +
 			               " (log_group VARCHAR, log_stream VARCHAR, retention_in_days BIGINT, created_ms BIGINT)",
 			           "create CloudWatch log-group table");
+			// One row per datum exactly as PutMetricData delivered it -- no rollup. Dimensions are a
+			// MAP rather than a JSON string so that both this listener's own filtering and a caller's
+			// queries work in core DuckDB, with no dependency on the json extension being loaded.
+			RunOrThrow("CREATE TABLE IF NOT EXISTS " + QualifiedMetrics() +
+			               " (namespace VARCHAR, metric_name VARCHAR, timestamp_ms BIGINT, value DOUBLE, "
+			               "unit VARCHAR, dimensions MAP(VARCHAR, VARCHAR))",
+			           "create CloudWatch metric table");
 		}
 		auto result = writer->Query("SELECT log_group, log_stream, timestamp_ms, ingestion_time_ms, event_id, message "
 		                            "FROM " +
@@ -953,6 +1237,7 @@ CloudwatchServerConfig ParseOptions(const Value &options) {
 	ReadOption(options, "schema_name", config.schema_name);
 	ReadOption(options, "table_name", config.table_name);
 	ReadOption(options, "groups_table_name", config.groups_table_name);
+	ReadOption(options, "metrics_table_name", config.metrics_table_name);
 	ReadOption(options, "allow_other_hostname", config.allow_other_hostname);
 	ReadOption(options, "create_table", config.create_table);
 	ReadOption(options, "auto_create_groups", config.auto_create_groups);

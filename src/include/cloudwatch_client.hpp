@@ -45,6 +45,9 @@ struct CloudwatchClient {
 	string PutLogEvents(ClientContext &context, const string &request_body) const;
 	string DescribeAlarms(ClientContext &context, const string &request_body) const;
 	string GetMetricData(ClientContext &context, const string &request_body) const;
+	//! Write custom metrics. The body is authored as JSON and flattened into the query protocol,
+	//! like GetMetricData -- the monitoring API accepts no JSON of its own.
+	string PutMetricData(ClientContext &context, const string &request_body) const;
 	string GetServiceGraph(ClientContext &context, const string &request_body) const;
 
 	//! Logs Insights. A scan is billed per byte, so a retry that duplicates a started query costs

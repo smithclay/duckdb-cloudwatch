@@ -9,6 +9,7 @@
 #include "logs_table.hpp"
 #include "metrics_table.hpp"
 #include "send_logs.hpp"
+#include "send_metrics.hpp"
 #include "service_dependencies.hpp"
 
 #include "duckdb.hpp"
@@ -22,6 +23,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterCloudwatchLogsInsightsFunction(loader);
 	RegisterCloudwatchMetricsFunction(loader);
 	RegisterCloudwatchSendLogsFunction(loader);
+	RegisterCloudwatchSendMetricsFunction(loader);
 	RegisterCloudwatchServiceDependenciesFunction(loader);
 	RegisterCloudwatchLogGroupAdminFunctions(loader);
 	// Local CloudWatch Logs listener: SELECT cloudwatch_serve([uri [, options_struct]]).

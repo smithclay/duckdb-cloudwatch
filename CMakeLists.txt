@@ -36,6 +36,7 @@ set(EXTENSION_SOURCES
     src/log_group_admin.cpp
 	 src/metrics_table.cpp
     src/send_logs.cpp
+    src/send_metrics.cpp
     src/alerts_table.cpp
     src/service_dependencies.cpp)
 

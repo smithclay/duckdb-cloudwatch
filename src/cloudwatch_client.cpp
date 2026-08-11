@@ -16,6 +16,8 @@
 #endif
 
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <ctime>
 #include <iomanip>
 #include <sstream>
@@ -58,6 +60,36 @@ string FormatQueryTimestamp(int64_t epoch_seconds) {
 	return output.str();
 }
 
+//! Query-protocol timestamps are ISO8601, not epoch seconds. GetMetricData carries them at the
+//! top level (StartTime/EndTime); PutMetricData carries one per datum, at
+//! MetricData.member.N.Timestamp -- hence the suffix match rather than a fixed name.
+bool IsQueryTimestampField(const string &prefix) {
+	if (prefix == "StartTime" || prefix == "EndTime" || prefix == "Timestamp") {
+		return true;
+	}
+	static const string suffix = ".Timestamp";
+	return prefix.size() > suffix.size() && prefix.compare(prefix.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+//! Shortest representation that round-trips back to the same double. std::to_string would emit
+//! six fixed decimals, which both truncates large metric values and pads every integral one.
+string FormatQueryDouble(double value) {
+	if (!std::isfinite(value)) {
+		throw IOException("CloudWatch request contains a non-finite metric value");
+	}
+	for (int precision = 15; precision <= 17; precision++) {
+		std::ostringstream output;
+		output << std::setprecision(precision) << value;
+		auto text = output.str();
+		if (std::strtod(text.c_str(), nullptr) == value) {
+			return text;
+		}
+	}
+	std::ostringstream output;
+	output << std::setprecision(17) << value;
+	return output.str();
+}
+
 void AppendQueryValue(vector<string> &parts, yyjson_val *value, const string &prefix) {
 	if (yyjson_is_obj(value)) {
 		size_t index, max;
@@ -81,26 +113,28 @@ void AppendQueryValue(vector<string> &parts, yyjson_val *value, const string &pr
 		text = yyjson_get_bool(value) ? "true" : "false";
 	} else if (yyjson_is_int(value)) {
 		auto integer = yyjson_get_sint(value);
-		text = (prefix == "StartTime" || prefix == "EndTime") ? FormatQueryTimestamp(integer) : std::to_string(integer);
+		text = IsQueryTimestampField(prefix) ? FormatQueryTimestamp(integer) : std::to_string(integer);
 	} else if (yyjson_is_real(value)) {
-		text = std::to_string(yyjson_get_real(value));
+		text = FormatQueryDouble(yyjson_get_real(value));
 	} else {
-		throw IOException("CloudWatch GetMetricData request contains an unsupported JSON value for %s", prefix);
+		throw IOException("CloudWatch query request contains an unsupported JSON value for %s", prefix);
 	}
 	parts.push_back(QueryEncode(prefix) + "=" + QueryEncode(text));
 }
 
-string BuildGetMetricDataQueryBody(const string &json_body) {
+//! Flatten a JSON request body into an AWS query-protocol form body. The monitoring API takes no
+//! JSON, so every call there is authored as JSON and encoded here.
+string BuildMonitoringQueryBody(const string &action, const string &json_body) {
 	auto document = yyjson_read(json_body.c_str(), json_body.size(), 0);
 	if (!document) {
-		throw IOException("CloudWatch GetMetricData request could not be encoded");
+		throw IOException("CloudWatch %s request could not be encoded", action);
 	}
 	auto root = yyjson_doc_get_root(document);
-	vector<string> parts = {"Action=GetMetricData", "Version=2010-08-01"};
+	vector<string> parts = {"Action=" + action, "Version=2010-08-01"};
 	try {
 		if (!root || !yyjson_is_obj(root)) {
 			yyjson_doc_free(document);
-			throw IOException("CloudWatch GetMetricData request must be a JSON object");
+			throw IOException("CloudWatch %s request must be a JSON object", action);
 		}
 		AppendQueryValue(parts, root, string());
 	} catch (...) {
@@ -109,6 +143,10 @@ string BuildGetMetricDataQueryBody(const string &json_body) {
 	}
 	yyjson_doc_free(document);
 	return StringUtil::Join(parts, "&");
+}
+
+string BuildGetMetricDataQueryBody(const string &json_body) {
+	return BuildMonitoringQueryBody("GetMetricData", json_body);
 }
 
 string XmlText(const string &xml, const string &tag) {
@@ -448,6 +486,16 @@ string CloudwatchClient::GetMetricData(ClientContext &context, const string &req
 	auto response = Post(context, CloudwatchService::MONITORING, "/", string(),
 	                     "application/x-www-form-urlencoded; charset=utf-8", BuildGetMetricDataQueryBody(request_body));
 	return ConvertGetMetricDataXml(response);
+}
+
+string CloudwatchClient::PutMetricData(ClientContext &context, const string &request_body) const {
+	// Not idempotent: PutMetricData has no request id, so a retry after a response we never saw
+	// would double-count the datums it carries. Only responses proving the call was rejected
+	// before doing any work may be retried.
+	std::lock_guard<std::mutex> write_guard(write_mutex);
+	return Post(context, CloudwatchService::MONITORING, "/", string(),
+	            "application/x-www-form-urlencoded; charset=utf-8",
+	            BuildMonitoringQueryBody("PutMetricData", request_body), CloudwatchRetryPolicy(false));
 }
 
 string CloudwatchClient::GetServiceGraph(ClientContext &context, const string &request_body) const {
