@@ -1,4 +1,5 @@
 #include "alerts_table.hpp"
+#include "cloudwatch_json.hpp"
 #include "service_dependencies.hpp"
 
 #include <cassert>
@@ -136,5 +137,99 @@ int main() {
 	assert(schema_names[14] == "configuration");
 	assert(schema_types[4] == LogicalType::TIMESTAMP);
 	assert(schema_types[10] == LogicalType::LIST(LogicalType::VARCHAR));
+
+	// --- Logs Insights ---------------------------------------------------------
+
+	// StartQuery takes epoch SECONDS while every other Logs API this extension calls takes
+	// milliseconds. The start truncates down and the end rounds up so the requested window is
+	// covered rather than clipped.
+	CloudwatchInsightsRequest insights;
+	insights.log_groups = {"/app/one", "/app/two"};
+	insights.query_string = "stats count(*) by service_name";
+	insights.start_time_ms = 1754800000001;
+	insights.end_time_ms = 1754800060001;
+	auto start_query = BuildCloudwatchStartQueryRequest(insights);
+	assert(start_query.find("\"startTime\":1754800000") != string::npos);
+	assert(start_query.find("\"endTime\":1754800061") != string::npos);
+	assert(start_query.find("\"logGroupNames\":[\"/app/one\",\"/app/two\"]") != string::npos);
+	// limit is omitted entirely at 0 so AWS applies its own default.
+	assert(start_query.find("limit") == string::npos);
+
+	insights.limit = 25;
+	assert(BuildCloudwatchStartQueryRequest(insights).find("\"limit\":25") != string::npos);
+
+	// An ARN anywhere in the list switches the whole list to logGroupIdentifiers, because AWS
+	// rejects a request carrying both keys.
+	insights.log_groups = {"/app/one", "arn:aws:logs:us-east-1:1:log-group:/app/two"};
+	auto arn_query = BuildCloudwatchStartQueryRequest(insights);
+	assert(arn_query.find("logGroupIdentifiers") != string::npos);
+	assert(arn_query.find("logGroupNames") == string::npos);
+
+	assert(ParseCloudwatchStartQueryResponse(R"({"queryId":"abc-123"})") == "abc-123");
+	bool missing_query_id = false;
+	try {
+		ParseCloudwatchStartQueryResponse(R"({})");
+	} catch (std::exception &) {
+		missing_query_id = true;
+	}
+	assert(missing_query_id);
+
+	assert(BuildCloudwatchQueryIdRequest("abc-123").find("\"queryId\":\"abc-123\"") != string::npos);
+
+	// Ragged rows are normal: the second row omits a field the first carries, and a field present
+	// with no value is a real result (an aggregate over an empty group) rather than a missing one.
+	auto results = ParseCloudwatchGetQueryResultsResponse(R"({
+	  "status": "Complete",
+	  "results": [
+	    [{"field": "service_name", "value": "checkout"}, {"field": "events", "value": "12"}],
+	    [{"field": "service_name", "value": "gateway"}]
+	  ],
+	  "statistics": {"recordsMatched": 12.0, "recordsScanned": 480.0}
+	})");
+	assert(results.status == CloudwatchInsightsStatus::COMPLETE);
+	assert(IsCloudwatchInsightsTerminal(results.status));
+	assert(results.rows.size() == 2);
+	assert(results.rows[0].fields.size() == 2);
+	assert(results.rows[0].fields[0].first == "service_name");
+	assert(results.rows[0].fields[1].second == "12");
+	assert(results.rows[1].fields.size() == 1);
+	assert(results.records_matched == 12);
+	assert(results.records_scanned == 480);
+
+	assert(!IsCloudwatchInsightsTerminal(ParseCloudwatchGetQueryResultsResponse(R"({"status":"Running"})").status));
+	assert(!IsCloudwatchInsightsTerminal(ParseCloudwatchGetQueryResultsResponse(R"({"status":"Scheduled"})").status));
+	assert(ParseCloudwatchGetQueryResultsResponse(R"({"status":"Failed"})").status == CloudwatchInsightsStatus::FAILED);
+	// An unrecognized status is treated as terminal so the poll loop cannot spin forever waiting
+	// for a state it will never reach.
+	auto unknown = ParseCloudwatchGetQueryResultsResponse(R"({"status":"SomethingNew"})");
+	assert(unknown.status == CloudwatchInsightsStatus::UNKNOWN);
+	assert(IsCloudwatchInsightsTerminal(unknown.status));
+	assert(unknown.status_text == "SomethingNew");
+
+	// --- log-group administration ----------------------------------------------
+
+	assert(BuildCloudwatchCreateLogGroupRequest("/app/logs") == R"({"logGroupName":"/app/logs"})");
+	assert(BuildCloudwatchDeleteLogGroupRequest("/app/logs") == R"({"logGroupName":"/app/logs"})");
+	auto create_stream = BuildCloudwatchCreateLogStreamRequest("/app/logs", "duckdb");
+	assert(create_stream.find("\"logGroupName\":\"/app/logs\"") != string::npos);
+	assert(create_stream.find("\"logStreamName\":\"duckdb\"") != string::npos);
+	assert(BuildCloudwatchPutRetentionPolicyRequest("/app/logs", 7).find("\"retentionInDays\":7") != string::npos);
+
+	assert(IsValidCloudwatchRetentionDays(1));
+	assert(IsValidCloudwatchRetentionDays(3653));
+	assert(!IsValidCloudwatchRetentionDays(2));
+	assert(!IsValidCloudwatchRetentionDays(0));
+	assert(!IsValidCloudwatchRetentionDays(-1));
+
+	// Idempotency depends on classifying AWS error codes, which appear in __type on most
+	// operations and inside message on others.
+	assert(CloudwatchErrorIs(R"({"__type":"ResourceAlreadyExistsException","message":"x"})",
+	                         "ResourceAlreadyExistsException"));
+	assert(CloudwatchErrorIs(R"({"message":"ResourceNotFoundException: nope"})", "ResourceNotFoundException"));
+	assert(!CloudwatchErrorIs(R"({"__type":"ThrottlingException"})", "ResourceNotFoundException"));
+	assert(!CloudwatchErrorIs("", "ResourceNotFoundException"));
+	// A non-JSON error body (a proxy's HTML page, say) can still name the exception.
+	assert(CloudwatchErrorIs("<html>ResourceNotFoundException</html>", "ResourceNotFoundException"));
+
 	return 0;
 }

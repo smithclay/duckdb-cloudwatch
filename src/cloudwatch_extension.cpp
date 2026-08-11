@@ -3,6 +3,9 @@
 #include "cloudwatch_extension.hpp"
 
 #include "cloudwatch_catalog.hpp"
+#include "cloudwatch_server.hpp"
+#include "log_group_admin.hpp"
+#include "logs_insights.hpp"
 #include "logs_table.hpp"
 #include "metrics_table.hpp"
 #include "send_logs.hpp"
@@ -16,9 +19,14 @@ namespace duckdb {
 static void LoadInternal(ExtensionLoader &loader) {
 	RegisterCloudwatchCatalog(loader);
 	RegisterCloudwatchLogsFunction(loader);
+	RegisterCloudwatchLogsInsightsFunction(loader);
 	RegisterCloudwatchMetricsFunction(loader);
 	RegisterCloudwatchSendLogsFunction(loader);
 	RegisterCloudwatchServiceDependenciesFunction(loader);
+	RegisterCloudwatchLogGroupAdminFunctions(loader);
+	// Local CloudWatch Logs listener: SELECT cloudwatch_serve([uri [, options_struct]]).
+	RegisterCloudwatchServerState(loader);
+	RegisterCloudwatchServerFunctions(loader);
 }
 
 void CloudwatchExtension::Load(ExtensionLoader &loader) {

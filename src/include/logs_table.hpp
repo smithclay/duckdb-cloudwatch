@@ -34,6 +34,12 @@ void GetCloudwatchLogsSchema(vector<LogicalType> &types, vector<string> &names);
 //! Validate settings shared by both SQL surfaces.
 void ValidateCloudwatchLogsSettings(const CloudwatchLogsSettings &settings, const string &error_prefix);
 
+//! Resolve one `now` / `-2h` / epoch-milliseconds / ISO-8601 time expression to epoch milliseconds.
+//! Shared so every SQL surface accepts the same time syntax, including Logs Insights (whose API
+//! takes seconds; that conversion happens when the request body is built).
+int64_t ParseCloudwatchTime(const string &value, int64_t now_ms, const string &parameter_name,
+                            const string &error_prefix);
+
 //! Build an already-bound scan for one log-group table in an attached catalog.
 TableFunction GetCloudwatchLogsTableScan(ClientContext &context, TableCatalogEntry &table, const string &secret_name,
                                          const string &log_group, const CloudwatchLogsSettings &settings,

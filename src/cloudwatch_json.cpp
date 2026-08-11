@@ -294,4 +294,234 @@ CloudwatchPutResponse ParseCloudwatchPutEventsResponse(const string &response) {
 	return result;
 }
 
+bool IsCloudwatchInsightsTerminal(CloudwatchInsightsStatus status) {
+	switch (status) {
+	case CloudwatchInsightsStatus::SCHEDULED:
+	case CloudwatchInsightsStatus::RUNNING:
+		return false;
+	default:
+		return true;
+	}
+}
+
+string BuildCloudwatchStartQueryRequest(const CloudwatchInsightsRequest &request) {
+	MutDocPtr doc(yyjson_mut_doc_new(nullptr));
+	auto root = yyjson_mut_obj(doc.get());
+	yyjson_mut_doc_set_root(doc.get(), root);
+
+	// ARNs go through logGroupIdentifiers, plain names through logGroupNames; AWS rejects a request
+	// that mixes the two keys. An ARN anywhere in the list therefore selects the identifier form
+	// for the whole list, which is safe because an ARN is a valid identifier for any group.
+	bool any_arn = false;
+	for (const auto &group : request.log_groups) {
+		if (StringUtil::StartsWith(group, "arn:")) {
+			any_arn = true;
+			break;
+		}
+	}
+	auto groups = yyjson_mut_arr(doc.get());
+	for (const auto &group : request.log_groups) {
+		yyjson_mut_arr_add_strncpy(doc.get(), groups, group.c_str(), group.size());
+	}
+	yyjson_mut_obj_add_val(doc.get(), root, any_arn ? "logGroupIdentifiers" : "logGroupNames", groups);
+
+	AddString(doc.get(), root, "queryString", request.query_string);
+	// StartQuery is specified in epoch seconds, unlike every other Logs API this extension calls.
+	// Truncate the start down and round the end up so the requested millisecond window is always
+	// covered rather than clipped.
+	yyjson_mut_obj_add_sint(doc.get(), root, "startTime", request.start_time_ms / 1000);
+	yyjson_mut_obj_add_sint(doc.get(), root, "endTime", (request.end_time_ms + 999) / 1000);
+	if (request.limit > 0) {
+		yyjson_mut_obj_add_sint(doc.get(), root, "limit", request.limit);
+	}
+	return WriteJson(doc.get());
+}
+
+string ParseCloudwatchStartQueryResponse(const string &response) {
+	DocPtr doc(yyjson_read(response.c_str(), response.size(), 0));
+	if (!doc) {
+		throw IOException("CloudWatch Logs StartQuery returned a response that is not valid JSON");
+	}
+	auto root = yyjson_doc_get_root(doc.get());
+	if (!root || !yyjson_is_obj(root)) {
+		throw IOException("CloudWatch Logs StartQuery returned a JSON response that is not an object");
+	}
+	string query_id;
+	if (!GetString(root, "queryId", query_id) || query_id.empty()) {
+		throw IOException("CloudWatch Logs StartQuery returned no queryId");
+	}
+	return query_id;
+}
+
+string BuildCloudwatchQueryIdRequest(const string &query_id) {
+	MutDocPtr doc(yyjson_mut_doc_new(nullptr));
+	auto root = yyjson_mut_obj(doc.get());
+	yyjson_mut_doc_set_root(doc.get(), root);
+	AddString(doc.get(), root, "queryId", query_id);
+	return WriteJson(doc.get());
+}
+
+namespace {
+
+CloudwatchInsightsStatus ParseInsightsStatus(const string &status) {
+	if (status == "Scheduled") {
+		return CloudwatchInsightsStatus::SCHEDULED;
+	}
+	if (status == "Running") {
+		return CloudwatchInsightsStatus::RUNNING;
+	}
+	if (status == "Complete") {
+		return CloudwatchInsightsStatus::COMPLETE;
+	}
+	if (status == "Failed") {
+		return CloudwatchInsightsStatus::FAILED;
+	}
+	if (status == "Cancelled") {
+		return CloudwatchInsightsStatus::CANCELLED;
+	}
+	if (status == "Timeout") {
+		return CloudwatchInsightsStatus::TIMEOUT;
+	}
+	// AWS documents an Unknown state and reserves the right to add more. Treating an unrecognized
+	// status as terminal stops the poll loop instead of spinning against a state we cannot reach.
+	return CloudwatchInsightsStatus::UNKNOWN;
+}
+
+} // namespace
+
+CloudwatchInsightsResults ParseCloudwatchGetQueryResultsResponse(const string &response) {
+	DocPtr doc(yyjson_read(response.c_str(), response.size(), 0));
+	if (!doc) {
+		throw IOException("CloudWatch Logs GetQueryResults returned a response that is not valid JSON");
+	}
+	auto root = yyjson_doc_get_root(doc.get());
+	if (!root || !yyjson_is_obj(root)) {
+		throw IOException("CloudWatch Logs GetQueryResults returned a JSON response that is not an object");
+	}
+
+	CloudwatchInsightsResults result;
+	GetString(root, "status", result.status_text);
+	result.status = ParseInsightsStatus(result.status_text);
+
+	auto results = yyjson_obj_get(root, "results");
+	if (results) {
+		if (!yyjson_is_arr(results)) {
+			throw IOException("CloudWatch Logs GetQueryResults returned a malformed results array");
+		}
+		size_t row_index, row_count;
+		yyjson_val *row;
+		yyjson_arr_foreach(results, row_index, row_count, row) {
+			if (!yyjson_is_arr(row)) {
+				throw IOException("CloudWatch Logs GetQueryResults returned a malformed result row");
+			}
+			CloudwatchInsightsRow parsed;
+			size_t field_index, field_count;
+			yyjson_val *field;
+			yyjson_arr_foreach(row, field_index, field_count, field) {
+				string name;
+				string value;
+				if (!GetString(field, "field", name)) {
+					continue;
+				}
+				// A field carrying no value is a real Insights result (an aggregate over an empty
+				// group), so keep the pair and let it surface as SQL NULL rather than dropping it.
+				GetString(field, "value", value);
+				parsed.fields.emplace_back(std::move(name), std::move(value));
+			}
+			result.rows.push_back(std::move(parsed));
+		}
+	}
+
+	auto statistics = yyjson_obj_get(root, "statistics");
+	if (statistics && yyjson_is_obj(statistics)) {
+		auto records_matched = yyjson_obj_get(statistics, "recordsMatched");
+		if (records_matched && yyjson_is_num(records_matched)) {
+			result.records_matched = static_cast<int64_t>(yyjson_get_num(records_matched));
+		}
+		auto records_scanned = yyjson_obj_get(statistics, "recordsScanned");
+		if (records_scanned && yyjson_is_num(records_scanned)) {
+			result.records_scanned = static_cast<int64_t>(yyjson_get_num(records_scanned));
+		}
+	}
+	return result;
+}
+
+namespace {
+
+//! Log-group requests address the group by name only. Unlike the read paths there is no ARN form:
+//! CreateLogGroup and PutRetentionPolicy accept logGroupName exclusively.
+string BuildLogGroupNameRequest(const string &log_group) {
+	MutDocPtr doc(yyjson_mut_doc_new(nullptr));
+	auto root = yyjson_mut_obj(doc.get());
+	yyjson_mut_doc_set_root(doc.get(), root);
+	AddString(doc.get(), root, "logGroupName", log_group);
+	return WriteJson(doc.get());
+}
+
+} // namespace
+
+string BuildCloudwatchCreateLogGroupRequest(const string &log_group) {
+	return BuildLogGroupNameRequest(log_group);
+}
+
+string BuildCloudwatchDeleteLogGroupRequest(const string &log_group) {
+	return BuildLogGroupNameRequest(log_group);
+}
+
+string BuildCloudwatchCreateLogStreamRequest(const string &log_group, const string &log_stream) {
+	MutDocPtr doc(yyjson_mut_doc_new(nullptr));
+	auto root = yyjson_mut_obj(doc.get());
+	yyjson_mut_doc_set_root(doc.get(), root);
+	AddString(doc.get(), root, "logGroupName", log_group);
+	AddString(doc.get(), root, "logStreamName", log_stream);
+	return WriteJson(doc.get());
+}
+
+string BuildCloudwatchPutRetentionPolicyRequest(const string &log_group, int64_t retention_days) {
+	MutDocPtr doc(yyjson_mut_doc_new(nullptr));
+	auto root = yyjson_mut_obj(doc.get());
+	yyjson_mut_doc_set_root(doc.get(), root);
+	AddString(doc.get(), root, "logGroupName", log_group);
+	yyjson_mut_obj_add_sint(doc.get(), root, "retentionInDays", retention_days);
+	return WriteJson(doc.get());
+}
+
+bool IsValidCloudwatchRetentionDays(int64_t days) {
+	static const int64_t VALID[] = {1,   3,   5,   7,   14,   30,   60,   90,   120,  150,  180,
+	                                365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653};
+	for (auto valid : VALID) {
+		if (days == valid) {
+			return true;
+		}
+	}
+	return false;
+}
+
+string CloudwatchRetentionDaysList() {
+	return "1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653";
+}
+
+bool CloudwatchErrorIs(const string &error_body, const char *exception_code) {
+	if (error_body.empty()) {
+		return false;
+	}
+	DocPtr doc(yyjson_read(error_body.c_str(), error_body.size(), 0));
+	if (doc) {
+		auto root = yyjson_doc_get_root(doc.get());
+		if (root && yyjson_is_obj(root)) {
+			// The Logs API puts the code in `__type` on most operations and inside `message` on a
+			// few; check both rather than depending on which one this operation happened to use.
+			for (const auto *key : {"__type", "message", "Message"}) {
+				auto value = GetString(root, key);
+				if (value && string(value).find(exception_code) != string::npos) {
+					return true;
+				}
+			}
+			return false;
+		}
+	}
+	// A non-JSON error body (a gateway page, say) can still name the exception.
+	return error_body.find(exception_code) != string::npos;
+}
+
 } // namespace duckdb

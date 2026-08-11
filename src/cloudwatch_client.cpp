@@ -383,7 +383,61 @@ string CloudwatchClient::DescribeLogGroups(ClientContext &context, const string 
 string CloudwatchClient::PutLogEvents(ClientContext &context, const string &request_body) const {
 	std::lock_guard<std::mutex> write_guard(write_mutex);
 	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.PutLogEvents", "application/x-amz-json-1.1",
-	            request_body, false);
+	            request_body, CloudwatchRetryPolicy(false, false));
+}
+
+string CloudwatchClient::StartQuery(ClientContext &context, const string &request_body) const {
+	// Not idempotent on purpose: a duplicate StartQuery scans (and bills for) the window twice.
+	// LimitExceededException here is the concurrent-query cap, which clears on its own.
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.StartQuery", "application/x-amz-json-1.1",
+	            request_body, CloudwatchRetryPolicy(false, true));
+}
+
+string CloudwatchClient::GetQueryResults(ClientContext &context, const string &request_body) const {
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.GetQueryResults", "application/x-amz-json-1.1",
+	            request_body);
+}
+
+string CloudwatchClient::StopQuery(ClientContext &context, const string &request_body) const {
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.StopQuery", "application/x-amz-json-1.1",
+	            request_body);
+}
+
+string CloudwatchClient::CreateLogGroup(ClientContext &context, const string &request_body) const {
+	std::lock_guard<std::mutex> write_guard(write_mutex);
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.CreateLogGroup", "application/x-amz-json-1.1",
+	            request_body);
+}
+
+string CloudwatchClient::CreateLogStream(ClientContext &context, const string &request_body) const {
+	std::lock_guard<std::mutex> write_guard(write_mutex);
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.CreateLogStream", "application/x-amz-json-1.1",
+	            request_body);
+}
+
+string CloudwatchClient::DeleteLogGroup(ClientContext &context, const string &request_body) const {
+	std::lock_guard<std::mutex> write_guard(write_mutex);
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.DeleteLogGroup", "application/x-amz-json-1.1",
+	            request_body);
+}
+
+string CloudwatchClient::PutRetentionPolicy(ClientContext &context, const string &request_body) const {
+	std::lock_guard<std::mutex> write_guard(write_mutex);
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.PutRetentionPolicy",
+	            "application/x-amz-json-1.1", request_body);
+}
+
+string CloudwatchClient::DescribeLogStreams(ClientContext &context, const string &request_body) const {
+	return Post(context, CloudwatchService::LOGS, "/", "Logs_20140328.DescribeLogStreams",
+	            "application/x-amz-json-1.1", request_body);
+}
+
+bool CloudwatchClient::TryPostLogs(ClientContext &context, const string &target, const string &request_body,
+                                   string &response_body, string &error_body) const {
+	// Creation and deletion are the only callers, and both mutate; serialize like the other writes.
+	std::lock_guard<std::mutex> write_guard(write_mutex);
+	return PostInternal(context, CloudwatchService::LOGS, "/", target, "application/x-amz-json-1.1", request_body,
+	                    CloudwatchRetryPolicy(), response_body, &error_body);
 }
 
 string CloudwatchClient::DescribeAlarms(ClientContext &context, const string &request_body) const {
@@ -403,7 +457,30 @@ string CloudwatchClient::GetServiceGraph(ClientContext &context, const string &r
 
 string CloudwatchClient::Post(ClientContext &context, CloudwatchService service, const string &path,
                               const string &target, const string &content_type, const string &request_body,
-                              bool idempotent) const {
+                              CloudwatchRetryPolicy policy) const {
+	string response_body;
+	PostInternal(context, service, path, target, content_type, request_body, policy, response_body, nullptr);
+	return response_body;
+}
+
+bool CloudwatchClient::PostInternal(ClientContext &context, CloudwatchService service, const string &path,
+                                    const string &target, const string &content_type, const string &request_body,
+                                    CloudwatchRetryPolicy policy, string &response_body, string *error_body) const {
+	const bool idempotent = policy.idempotent;
+	//! Report a non-2xx either by filling the caller's buffer or by throwing.
+	auto fail = [&](const string &message, const string &body) -> bool {
+		if (!error_body) {
+			throw IOException("%s", message);
+		}
+		*error_body = body.empty() ? message : body;
+		return false;
+	};
+	auto retryable_response = [&](int status, const string &body) {
+		if (policy.retry_on_limit_exceeded && body.find("LimitExceededException") != string::npos) {
+			return true;
+		}
+		return idempotent ? IsRetryableStatus(status, body) : IsDefinitelyRejectedThrottle(status, body);
+	};
 	bool refreshed_credentials = false;
 	for (uint64_t attempt = 0;; attempt++) {
 		if (context.interrupted) {
@@ -442,7 +519,8 @@ string CloudwatchClient::Post(ClientContext &context, CloudwatchService service,
 		request.try_request = true;
 		auto response = http_util.Request(request);
 		if (response && response->Success()) {
-			return response->body;
+			response_body = response->body;
+			return true;
 		}
 		auto status = response ? static_cast<int>(response->status) : 0;
 		auto body = response ? response->body : string();
@@ -451,12 +529,12 @@ string CloudwatchClient::Post(ClientContext &context, CloudwatchService service,
 			refreshed_credentials = true;
 			continue;
 		}
-		const bool safe_retry =
-		    response && (idempotent ? IsRetryableStatus(status, body) : IsDefinitelyRejectedThrottle(status, body));
+		const bool safe_retry = response && retryable_response(status, body);
 		if (attempt >= retries || !safe_retry) {
-			throw IOException("AWS %s request to %s failed%s%s", AwsServiceName(service), BaseUrl(service),
-			                  status ? StringUtil::Format(" with HTTP %d", status) : string(),
-			                  body.empty() ? string() : ": " + body);
+			return fail(StringUtil::Format("AWS %s request to %s failed%s%s", AwsServiceName(service), BaseUrl(service),
+			                               status ? StringUtil::Format(" with HTTP %d", status) : string(),
+			                               body.empty() ? string() : ": " + body),
+			            body);
 		}
 #else
 		duckdb_httplib_openssl::Headers headers = {
@@ -475,13 +553,16 @@ string CloudwatchClient::Post(ClientContext &context, CloudwatchService service,
 		// particular, cpp-httplib otherwise synthesizes Host and Content-Type after signing.
 		auto response = GetConnection(service).Post(path, headers, request_body, string());
 		if (response && response->status >= 200 && response->status < 300) {
-			return response->body;
+			response_body = response->body;
+			return true;
 		}
 		if (!response) {
 			auto error = response.error();
 			connection.reset();
 			const bool safe_retry = idempotent ? IsRetryableTransportError(error) : IsPreSendTransportError(error);
 			if (attempt >= retries || !safe_retry) {
+				// A transport failure carries no AWS error code, so there is nothing for a
+				// TryPostLogs caller to classify: surface it as an exception either way.
 				throw IOException("AWS %s request to %s failed: %s", AwsServiceName(service), BaseUrl(service),
 				                  duckdb_httplib_openssl::to_string(error));
 			}
@@ -489,10 +570,10 @@ string CloudwatchClient::Post(ClientContext &context, CloudwatchService service,
 			credentials = GetCloudwatchCredentials(context, credentials.secret_name, credentials.region);
 			refreshed_credentials = true;
 			continue;
-		} else if (attempt >= retries ||
-		           !(idempotent ? IsRetryableStatus(response->status, response->body)
-		                        : IsDefinitelyRejectedThrottle(response->status, response->body))) {
-			throw IOException("AWS %s returned HTTP %d: %s", AwsServiceName(service), response->status, response->body);
+		} else if (attempt >= retries || !retryable_response(response->status, response->body)) {
+			return fail(StringUtil::Format("AWS %s returned HTTP %d: %s", AwsServiceName(service), response->status,
+			                               response->body),
+			            response->body);
 		}
 #endif
 		SleepCheckingInterrupt(context, RetryDelay(attempt));

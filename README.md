@@ -143,8 +143,15 @@ FROM read_cloudwatch_logs('/archive/orders', start_time => '-1h') l;
 The log group and stream arguments must be constant strings. That makes the destination explicit,
 lets the function batch rows safely, and avoids turning row data into AWS resource names by
 accident. Both resources must already exist; the sender never creates or mutates groups, streams,
-or retention policies. The optional fourth argument is a constant `aws`/`s3` secret name; region
-and refreshable credentials use the same resolution path as the reader.
+or retention policies — use the [administration functions](#log-group-administration) for that. The
+optional fourth argument is a constant `aws`/`s3` secret name; region and refreshable credentials
+use the same resolution path as the reader. An optional fifth argument overrides the endpoint (a
+private VPC endpoint, or a local [`cloudwatch_serve`](#cloudwatch_serve) listener):
+
+```sql
+SELECT send_cloudwatch_logs(l, '/app/orders', 'duckdb-import', 'cw_prod', 'http://localhost:10519')
+FROM my_logs l;
+```
 
 CloudWatch exposes only a message and timestamp on each writable event, so the mapping is
 deliberately narrow:
@@ -173,6 +180,148 @@ silently duplicating logs. AWS can partially accept a request while returning HT
 `rejectedLogEventsInfo` or rejected entity is reported as an error instead of marking every row
 `'ok'`. Earlier batches may already be stored if a later batch fails. Sending requires
 `logs:PutLogEvents` on the destination stream.
+
+## `read_cloudwatch_logs_insights`
+
+`FilterLogEvents` can only return whole events, so any aggregation happens after every matching row
+has crossed the network. `read_cloudwatch_logs_insights` runs a
+[CloudWatch Logs Insights](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_StartQuery.html)
+query instead, which aggregates inside CloudWatch and returns only the result:
+
+```sql
+SELECT service_name, CAST(events AS BIGINT) AS events
+FROM read_cloudwatch_logs_insights(
+    'filter status_code = 2 | stats count(*) as events by service_name',
+    log_groups => ['/app/checkout', '/app/gateway'],
+    start_time => '-1h',
+    secret     => 'cw_prod'
+)
+ORDER BY events DESC;
+```
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `log_groups` | VARCHAR[] | — | One to 50 log-group names or ARNs. Required (or `log_group` for a single one). |
+| `log_group` | VARCHAR | — | Convenience form for a single group; combines with `log_groups`. |
+| `start_time` | VARCHAR | `-15m` | Same forms as `read_cloudwatch_logs`. |
+| `end_time` | VARCHAR | `now` | Same forms as `start_time`. |
+| `max_rows` | BIGINT | `0` | Row cap, 1–10,000; 0 uses the AWS default of 1,000. Also spelled `"limit"` (quoted — it is a reserved word). |
+| `max_wait` | BIGINT | `300` | Seconds to wait for the query before giving up and stopping it. |
+| `poll_interval_ms` | BIGINT | `500` | How often to poll `GetQueryResults`. |
+| `secret` / `region` / `endpoint` / `retries` / `timeout` | | | As on `read_cloudwatch_logs`. |
+
+The result schema depends on the query, so the query is executed during binding and its columns are
+taken from the field names AWS returns, in first-seen order across rows. A field only some rows
+carry still gets a column and is `NULL` elsewhere. Every column is `VARCHAR`, because Insights
+returns all values — including `stats` aggregates — as strings; cast what you need. An aggregation
+that matches nothing returns no rows, and the binder falls back to a single `@message` column.
+
+Insights charges per byte scanned, so a retried `StartQuery` would bill twice: this function retries
+only responses proving no query began (throttling and the concurrent-query limit). If the query is
+interrupted or exceeds `max_wait`, `StopQuery` is called so the scan stops being billed. Note that
+`count_distinct` is approximate above roughly 10,000 distinct values — count a field you know is
+unique per row when you need an exact number.
+
+Requires `logs:StartQuery`, `logs:GetQueryResults`, and `logs:StopQuery`.
+
+## Log-group administration
+
+`send_cloudwatch_logs` deliberately never creates its destination. These four functions do, and each
+is idempotent — reporting the outcome rather than raising on AWS's "already exists"/"does not exist"
+errors — so bootstrap and teardown are re-runnable:
+
+```sql
+-- One row per group; the name argument is evaluated per row, unlike the sender's constant
+-- destination, so a whole inventory can be created from a query.
+SELECT log_group, create_cloudwatch_log_group(log_group, 'cw_prod') AS created
+FROM (VALUES ('/app/checkout'), ('/app/gateway')) t(log_group);
+
+SELECT create_cloudwatch_log_stream('/app/checkout', 'duckdb', 'cw_prod');
+SELECT put_cloudwatch_retention_policy('/app/checkout', 1, 'cw_prod');
+SELECT delete_cloudwatch_log_group('/app/checkout', 'cw_prod');
+```
+
+| Function | Returns | Requires |
+|---|---|---|
+| `create_cloudwatch_log_group(name [, secret [, endpoint]])` | `'created'` / `'exists'` | `logs:CreateLogGroup` |
+| `create_cloudwatch_log_stream(group, stream [, secret [, endpoint]])` | `'created'` / `'exists'` | `logs:CreateLogStream` |
+| `put_cloudwatch_retention_policy(group, days [, secret [, endpoint]])` | `'ok'` | `logs:PutRetentionPolicy` |
+| `delete_cloudwatch_log_group(name [, secret [, endpoint]])` | `'deleted'` / `'absent'` | `logs:DeleteLogGroup` |
+
+The secret name and endpoint must be constants; the group, stream, and retention arguments are
+evaluated per row. `retention_days` is checked against the values CloudWatch accepts (1, 3, 5, 7,
+14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653) before
+any request is made, because AWS's own rejection does not name them. Deleting a log group discards
+its streams and events.
+
+## `cloudwatch_serve`
+
+`cloudwatch_serve` runs a local CloudWatch Logs endpoint inside DuckDB and stores what it receives
+in a table. It speaks the AWS JSON 1.1 wire protocol, so it works as a test double for this
+extension's own read/write paths **and as a real sink for the Amazon CloudWatch Agent**, which
+accepts an arbitrary destination through its `logs.endpoint_override` setting:
+
+```sql
+-- Returns the endpoint URL to pass to `endpoint =>` or to the agent.
+SELECT cloudwatch_serve('cloudwatch:localhost:10519');
+
+SELECT count(*), min(timestamp_ms) FROM cloudwatch_logs;   -- received events
+SELECT * FROM cloudwatch_log_groups;                       -- groups/streams and retention
+
+SELECT cloudwatch_stop('cloudwatch:localhost:10519');
+```
+
+Received events land in `cloudwatch_logs` as `(log_group, log_stream, timestamp_ms,
+ingestion_time_ms, event_id, message)` — CloudWatch's own shape rather than OTLP, because
+`PutLogEvents` carries nothing else. Read them back through `read_cloudwatch_logs(...,
+endpoint => 'http://localhost:10519')` to get the 18-column mapping.
+
+Options (second argument, a `STRUCT`): `schema_name`, `table_name`, `groups_table_name`,
+`create_table`, `allow_other_hostname`, `auto_create_groups`, `max_body_bytes`, `http_threads`.
+
+Implemented operations are `CreateLogGroup`, `CreateLogStream`, `DeleteLogGroup`,
+`PutRetentionPolicy`, `DescribeLogGroups`, `DescribeLogStreams`, and `PutLogEvents` — the set the
+CloudWatch Agent uses — plus `FilterLogEvents` for reading back. Behaviour is faithful where it
+matters: `PutLogEvents` to an unknown group fails with `ResourceNotFoundException` rather than
+creating one implicitly (set `auto_create_groups` to change that), so the agent's real
+create-then-send sequence is exercised.
+
+Deliberate limits. SigV4 signatures are accepted without verification, since the listener has no
+access to the caller's secret key; binding anywhere but loopback therefore requires
+`allow_other_hostname`. Logs Insights is not implemented — emulating its query language would give
+false confidence, so query the received table in SQL instead. Only substring filter patterns are
+honoured on `FilterLogEvents`; the JSON and metric-filter syntaxes are rejected rather than silently
+matching everything.
+
+### Receiving from a real CloudWatch Agent
+
+```jsonc
+// /etc/cwagentconfig/agent.json — the only agent-side change is endpoint_override
+{
+  "agent": {"region": "us-east-1"},
+  "logs": {
+    "endpoint_override": "http://your-host:10519",
+    "logs_collected": {"files": {"collect_list": [
+      {"file_path": "/var/log/app.log", "log_group_name": "/app/logs", "log_stream_name": "agent"}
+    ]}}
+  }
+}
+```
+
+The listener must bind an address the agent can reach:
+
+```sql
+SELECT cloudwatch_serve('cloudwatch:0.0.0.0:10519', {'allow_other_hostname': true});
+```
+
+Two things to know. Off EC2 the agent runs in "onPrem" mode and reads credentials from the shared
+credentials file under the `AmazonCloudWatchAgent` profile, ignoring `AWS_ACCESS_KEY_ID`; the values
+are never checked, but it will not send without them. And the agent gzips any batch that compresses,
+which the listener inflates itself — DuckDB's bundled cpp-httplib has no zlib decoder, so the
+request's `Content-Encoding` is moved aside before the body is read.
+
+`test/e2e/cloudwatch_agent.sh` runs this end to end against a real agent container and asserts that
+it creates the group and stream and delivers its events.
 
 ## Alarms and service dependencies
 
@@ -233,7 +382,8 @@ service, trace, or span fields from arbitrary JSON messages. Applications can pa
 DuckDB's JSON functions and project their own conventions without losing the original event.
 
 CloudWatch log transformation is not applied by `FilterLogEvents`; AWS returns the original event.
-Use Logs Insights when transformed fields are required (a future extension surface).
+Use [`read_cloudwatch_logs_insights`](#read_cloudwatch_logs_insights) when transformed fields are
+required.
 
 ## Build and test
 
@@ -246,6 +396,16 @@ cmake --build build/release --target cloudwatch_signing_test
 ./build/release/extension/cloudwatch/cloudwatch_signing_test
 cmake --build build/release --target cloudwatch_protocol_test
 ./build/release/extension/cloudwatch/cloudwatch_protocol_test
+```
+
+`make test` is offline: it covers argument and protocol validation, which happens before any
+credential lookup. The two end-to-end scripts exercise the request paths for real against
+`cloudwatch_serve`. They live outside `test/sql` because the `aws`/`s3` secret types are registered
+by httpfs, which the sqllogictest binary cannot autoload:
+
+```bash
+./test/e2e/roundtrip.sh         # bootstrap, send, read back, tear down — no network, no Docker
+./test/e2e/cloudwatch_agent.sh  # a real Amazon CloudWatch Agent shipping into DuckDB (needs Docker)
 ```
 
 The extension currently targets native DuckDB builds. Its distribution workflow excludes WASM
